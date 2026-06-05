@@ -62,7 +62,7 @@ planner_model = ChatGoogleGenerativeAI(
 all_tools = [tools.read_file, tools.bash, tools.write_file, tools.str_replace]
 tools_by_name = {tool.name: tool for tool in all_tools}
 
-worker_tools = [tools.read_file, tools.write_file, tools.str_replace]
+worker_tools = [tools.read_file, tools.write_file, tools.str_replace, tools.bash]
 evaluator_tools = [tools.read_file, tools.bash]
 planner_tools = [tools.read_file, tools.write_file, tools.str_replace]
 
@@ -78,37 +78,32 @@ def get_content(response) -> str:
         return response.content[0].get("text", "")
     return ""
 
-def format_messages(state: AgentState, node: str) -> str:
+def format_messages(state: AgentState, node: str, char_limit: int = 3000) -> str:
     messages = state.get("node_messages", {}).get(node, [])
     lines = []
     for msg in messages:
+        content = get_content(msg)
+        content = content[:char_limit] + "[TRUNCATED]" if len(content) > char_limit else content
         if isinstance(msg, HumanMessage):
-            lines.append(f"USER: {get_content(msg)}")
+            lines.append(f"USER: {content}")
         elif isinstance(msg, AIMessage):
-            content = get_content(msg)
             if content:
                 lines.append(f"ASSISTANT: {content}")
             for tc in msg.tool_calls:
                 args = ", ".join(f"{k}={repr(v)}" for k, v in tc["args"].items())
                 lines.append(f"ASSISTANT called tool `{tc['name']}({args})`")
         elif isinstance(msg, ToolMessage):
-            lines.append(f"TOOL RESULT:\n{get_content(msg)}")
+            lines.append(f"TOOL RESULT:\n{content}")
     return "\n\n".join(lines)
 
 
 async def planner_node(state: AgentState):
-    previous_agent_log = state['node_messages'].get(state.get('active_node'), [])
     systemprompt = """
 You are a senior software engineer who plans and manages tasks in the codebase.
 You DON'T implement code.
 Project planning and descriptions must be stored in store.json
 """
     humanmessage = f"""
-Read the REQUIREMENTS.md file. Plan the project outline, define signatures, interfaces and tests.
-Clearly define what is file or directory.
-Message from previous agent:
-{previous_agent_log[-1].content if previous_agent_log else ''}
-    
 Your log:
 {format_messages(state, 'planner')}
 """
@@ -132,52 +127,16 @@ Your log:
         return {"passed": False}
 
 
-async def worker1_node(state: AgentState):
+async def worker2_node(state: AgentState):
     previous_agent_log = state['node_messages'].get(state.get('active_node'), [])
     systemprompt = """
 You are an expert software programmer.
 You have access to tools for reading and writing files.
 """
     humanmessage = f"""
-Read the project info at store.json and implement all the files and directory layout.
-Do NOT write the tests.
+Read the project info at store.json and select the first pending task, execute it.
 
 Message from previous agent:
-{previous_agent_log[-1].content if previous_agent_log else ''}
-    
-Your log:
-{format_messages(state, 'worker1')}
-"""
-    print(f'WORKER1 PROMPT: {humanmessage}')
-    try:
-        response = await asyncio.wait_for(
-            worker1_model.ainvoke([
-                SystemMessage(content=systemprompt),
-                HumanMessage(content=humanmessage)
-            ]),
-            timeout=180
-        )
-        usage = response.response_metadata
-        return {
-            "active_node": "worker1",
-            "node_messages": {"worker1": [response]},
-            "input_tokens": usage.get("prompt_eval_count", 0),
-            "output_tokens": usage.get("eval_count", 0),
-        }
-    except asyncio.TimeoutError:
-        return {"passed": False}
-
-
-async def worker2_node(state: AgentState):
-    active = state.get('active_node')
-    previous_agent_log = state['node_messages'].get(active, [])
-    systemprompt = """
-You are an expert software tester.
-"""
-    humanmessage = f"""
-Read the project info at store.json and create the tests in the correct path.
-
-Message from {active} agent:
 {previous_agent_log[-1].content if previous_agent_log else ''}
     
 Your log:
@@ -203,19 +162,54 @@ Your log:
         return {"passed": False}
 
 
+async def worker1_node(state: AgentState):
+    active = state.get('active_node')
+    previous_agent_log = state['node_messages'].get(active, [])
+    systemprompt = """
+You are an expert software tester.
+"""
+    humanmessage = f"""
+Read the project info at store.json and select the first pending task, execute it.
+ONLY prepare the test code/environment/dependencies for the test, but DO NOT run it.
+
+Message from {active} agent:
+{previous_agent_log[-1].content if previous_agent_log else ''}
+    
+Your log:
+{format_messages(state, 'worker1')}
+"""
+    print(f'WORKER1 PROMPT: {humanmessage}')
+    try:
+        response = await asyncio.wait_for(
+            worker1_model.ainvoke([
+                SystemMessage(content=systemprompt),
+                HumanMessage(content=humanmessage)
+            ]),
+            timeout=180
+        )
+        usage = response.response_metadata
+        return {
+            "active_node": "worker1",
+            "node_messages": {"worker1": [response]},
+            "input_tokens": usage.get("prompt_eval_count", 0),
+            "output_tokens": usage.get("eval_count", 0),
+        }
+    except asyncio.TimeoutError:
+        return {"passed": False}
+
+
 async def test_evaluator_node(state: AgentState):
     previous_agent_log = state['node_messages'].get(state.get('active_node'), [])
     systemprompt = """
 You are an expert QA evaluator.
-You have tools to read files and execute commands.
 For vitest, always use 'npx vitest run' or 'npm test -- --run' to avoid watch mode blocking.
 """
     humanmessage = f"""
-Read the project details at store.json and evaluate the tests written for the code.
-Respond with just GOOD if the tests comply, and briefly explain the error if they do not.
-You have the liberty to fix dependencies or package issues.
-BE STRICT, do not approve a test file that does not even run.
-DO NOT write or modify the tests.
+Read the project details at store.json and notice the first pending task.
+Follow the test instructions of the task to evaluate its implementation.
+If it is done, mark it as done in the store and reply just OK, if it's not then reply
+with what failed and a brief explanation.
+DO NOT write or modify the code.
 
 Message from previous agent:
 {previous_agent_log[-1].content if previous_agent_log else ''}
@@ -233,7 +227,7 @@ Your log:
             timeout=60
         )
         usage = response.response_metadata
-        passed = 'GOOD' in response.content
+        passed = 'OK' in response.content
         return {
             "active_node": "test_evaluator",
             "node_messages": {"test_evaluator": [response]},
@@ -255,3 +249,4 @@ def tool_node(state: AgentState):
         observation = tool.invoke(tool_call["args"])
         result.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
     return {"node_messages": {active: result}}
+

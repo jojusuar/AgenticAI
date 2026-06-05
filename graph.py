@@ -2,7 +2,7 @@ import asyncio
 from typing import Literal
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import RetryPolicy
-from langchain.messages import AIMessage
+from langchain.messages import AIMessage, HumanMessage
 import nodes
 
 MAX_REFLECTION_LOOPS = 3
@@ -59,14 +59,19 @@ graph.add_conditional_edges("tool_node", route_tool_response, ["worker1", "worke
 agent = graph.compile()
 
 
-async def runloop():
-    from IPython.display import Image, display
-    display(Image(agent.get_graph(xray=True).draw_mermaid_png()))
-    from langchain.messages import HumanMessage
+async def runloop(prompt: str):
+    with open("graph.png", "wb") as f:
+        f.write(agent.get_graph(xray=True).draw_mermaid_png())
     result = await agent.ainvoke({
-        "node_messages": {"planner": [HumanMessage(content="")]},
+        "node_messages": {"planner": [HumanMessage(content=prompt)]},
         "reflection_count": 0,
         "passed": False,
     })
 
-asyncio.run(runloop())
+prompt = f'''
+Read the REQUIREMENTS.md file. Plan the code implementation in self-contained tasks 
+that can be performed in parallel. Describe the directory and file structure.
+Each task must have its own test. A final integration test is also required.
+'''
+
+asyncio.run(runloop(prompt))
