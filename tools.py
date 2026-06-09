@@ -1,7 +1,8 @@
 import json
-
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.tools import tool
 import subprocess, pathlib
+import asyncio
 
 WORKSPACE = pathlib.Path("workspace").resolve()
 
@@ -73,6 +74,8 @@ def bash(command: str, timeout: int = 900) -> str:
         timeout: Maximum seconds to wait before killing the process. Defaults to 30.
                  Increase for long-running operations like installs or test suites.
     """
+    if "cd " in command:
+        return "Error: changing directories is not allowed"
     result = subprocess.run(
         command,
         shell=True,
@@ -82,5 +85,23 @@ def bash(command: str, timeout: int = 900) -> str:
         cwd=WORKSPACE,
         stdin=subprocess.DEVNULL
     )
-    out = (result.stdout + result.stderr)[:8000]
+    out = (result.stdout + result.stderr)
     return out or "(no output)"
+
+
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
+mcp_client = MultiServerMCPClient({
+    "codegraph": {
+        "url": "http://localhost:8080/sse",
+        "transport": "sse",
+    }
+})
+
+CODEGRAPH_KEEP = {"search_entities", "get_dependencies", "get_callers", "global_search", "local_search", "get_file_structure", "query_codebase"}
+async def init_mcp():
+    all_mcp = await mcp_client.get_tools()
+    return [t for t in all_mcp if t.name in CODEGRAPH_KEEP]
+
+codegraph_tools = _loop.run_until_complete(init_mcp())
