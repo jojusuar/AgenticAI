@@ -4,6 +4,10 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import RetryPolicy
 from langchain.messages import AIMessage, HumanMessage
 import nodes
+import sys
+import json
+import time
+import subprocess
 
 MAX_REFLECTION_LOOPS = 50
 MAX_CONTEXT_MESSAGES = 20
@@ -13,14 +17,17 @@ def route_tool_response(state: nodes.AgentState) -> Literal["testwriter", "progr
     return state["active_node"]
 
 
-def route_planner(state: nodes.AgentState) -> Literal["tool_node", "programmer", "planner", "compactor"]:
-    last_message = state["node_messages"].get("planner", [])[-1]
+def route_planner(state: nodes.AgentState) -> Literal["tool_node", "programmer", "planner", "compactor", END]:
+    log = state["node_messages"].get("planner", [])
+    last_message = log[-1] if log else None
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
     if state['node_completed']:
         return "programmer"
     if state.get("timeout"):
         return "compactor"
+    if state.get("finished"):
+        return END
     return "planner"
 
 
@@ -49,13 +56,6 @@ def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programme
         return "compactor"
     return "programmer"
 
-
-def route_context_cleaner(state: nodes.AgentState) -> Literal["programmer", END]:
-    if state['finished']:
-        return END
-    return 'programmer'
-
-
 def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "testwriter", "evaluator", "context_cleaner", "compactor"]:
     log = state["node_messages"].get("evaluator", [])
     last_message = log[-1] if log else None
@@ -83,6 +83,7 @@ graph.add_node("context_cleaner", nodes.context_cleaner_node)
 graph.add_node("compactor", nodes.compactor_node)
 
 graph.add_edge(START, "planner")
+graph.add_edge("context_cleaner", "planner")
 
 graph.add_conditional_edges("planner", route_planner, ["tool_node", "programmer", "planner", "compactor"])
 graph.add_conditional_edges("testwriter", route_testwriter, ["tool_node", "evaluator", "testwriter", "compactor"])
@@ -90,14 +91,10 @@ graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "progr
 graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "testwriter", "context_cleaner", "evaluator", "compactor"])
 graph.add_conditional_edges("tool_node", route_tool_response, ["testwriter", "programmer", "planner", "evaluator", "compactor"])
 graph.add_conditional_edges("compactor", route_compactor, ["testwriter", "programmer", "planner", "evaluator", "compactor"])
-graph.add_conditional_edges("context_cleaner", route_context_cleaner, ["programmer", END])
 
 agent = graph.compile()
 
-
-async def runloop(prompt: str):
-    with open("graph.png", "wb") as f:
-        f.write(agent.get_graph(xray=True).draw_mermaid_png())
+async def runloop(prompt: str,):
     result = await agent.ainvoke({
         "node_messages": {"planner": [HumanMessage(content=prompt)]},
         "reflection_count": 0,
@@ -107,37 +104,34 @@ async def runloop(prompt: str):
     })
     return result
 
-prompt = f'''
-Read the REQUIREMENTS.md file. Concisely divide the code implementation into tasks.
-If a task's results are reasonably testable programatically, describe how it should be tested.
-Describe the folder and file structure. Write the plan details to store.json.
-When you are done, just reply PLANNING DONE.
+if __name__ == "__main__":
 
-store.json expected schema:
-{{
-    "project_info": dict with any relevant info about the project (e.g. programming language, framework, libraries, etc) that can be useful for implementation and testing,
-    "tasks": [
-        {{
-            "task": "Short task description, function signature if applicable, and any relevant details for implementation.",
-            "test_instructions": "Instructions to implement the test for this task, including any relevant comments from the test file."
-            "mentioned_files": ["list", "of", "files", "relevant", "to", "this", "task", "for", "implementation"]
-        }},
-        ...
-    ],
-    "file_structure": {{
-        "folder1": {{
-            "subfolder1": ["file1.py", "file2.py"],
-            ...
-        }},
-        ...
-    }}
-}}
-'''
+    codegraph = subprocess.Popen(
+        ["codegraph-mcp", "start"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
-output = asyncio.run(runloop(prompt))
-print(f"Input tokens:  {output['input_tokens']}")
-print(f"Output tokens: {output['output_tokens']}")
-print(f"Total tokens:  {output['input_tokens'] + output['output_tokens']}")
+    try:
+        time.sleep(3)
 
+        prompt_file = sys.argv[1]
 
-#TODO: revisar si el evaluator en serio esta respondiendo siempre lo mismo o usando stale tests (pytest_cache?)
+        with open(prompt_file) as f:
+            prompt = f.read()
+
+        result = asyncio.run(runloop(prompt))
+
+        with open("/app/workspace/_result.json", "w") as f:
+            json.dump({
+                "input_tokens": result.get("input_tokens", 0),
+                "output_tokens": result.get("output_tokens", 0),
+            }, f)
+
+    finally:
+        codegraph.terminate()
+
+        try:
+            codegraph.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            codegraph.kill()

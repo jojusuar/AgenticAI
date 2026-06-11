@@ -30,7 +30,7 @@ class AgentState(TypedDict):
     output_tokens: int
     fixing: bool
     fault: str
-    tasks: list
+    task: str
     timeout: bool
     finished: bool
     node_completed: bool
@@ -97,6 +97,38 @@ You are a senior software engineer who plans and manages tasks in the codebase.
 You DON'T implement code.
 """
     humanmessage = f"""
+Your job is to plan the development of a software codebase.
+The start.md file are the requirements the system must meet. Read it and
+explore the current state of the workspace to concisely divide the code implementation into tasks.
+If a task's results are reasonably testable programatically, describe how it should be tested.
+Describe the folder and file structure. Write the plan details to store.json, which will persist across loops.
+Decide the current task based on the state of the workspace.
+When planning is done but the codebase is not ready yet, reply PLANNING_DONE
+When the codebase mirrors the start.md requirements, reply PROJECT_DONE
+
+store.json expected schema:
+{{
+    "project_info": dict with any relevant info about the project (e.g. programming language, framework, libraries, etc) that can be useful for implementation and testing,
+    "current_task": {{
+            "task": "Short task description, function signature if applicable, and any relevant details for implementation.",
+            "test_instructions": "Instructions to implement the test for this task, including any relevant comments from the test file."
+            "mentioned_files": ["list", "of", "files", "relevant", "to", "this", "task", "for", "implementation"]
+    }}
+    "upcoming_tasks": [ tasks like current_task ],
+    "file_structure": {{
+        "folder1": {{
+            "subfolder1": ["file1.py", "file2.py"],
+            ...
+        }},
+        ...
+    }}
+}}
+
+Your expected response schema:
+{{
+    "status": "PLANNING_DONE|PROJECT_DONE"
+}}
+
 Your log (last is most recent):
 {format_messages(state, 'planner')}
 """
@@ -110,14 +142,25 @@ Your log (last is most recent):
             timeout=300
         )
         usage = response.response_metadata.get("token_usage", {})
-        tasks = []
+        
         node_completed = False
+        finished = False
+        task = ''
+
         cleaned = remove_think_tags(get_content(response))
-        if "PLANNING DONE" == cleaned:
+        try:
+            cleaned = json.loads(cleaned)
+        except Exception as e:
+            pass
+        if isinstance(cleaned, dict):
             print(get_content(response))
-            plan = json.load(open("workspace/store.json"))
-            tasks = plan.get("tasks", [])
-            node_completed = True
+            if cleaned.get('status', '') == "PLANNING_DONE":
+                plan = json.load(open("workspace/store.json"))
+                task = plan.get("current_task", '')
+                node_completed = True
+            if cleaned.get('status', '') == "PROJECT_DONE":
+                finished = True
+
         return {
             "active_node": "planner",
             "node_messages": {
@@ -127,8 +170,9 @@ Your log (last is most recent):
             "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
             "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
             "node_completed": node_completed,
+            "finished": finished,
             "timeout": False,
-            "tasks": tasks
+            "task": task
         }
     except asyncio.TimeoutError:
         print("PLANNER TIMEOUT")
@@ -142,11 +186,11 @@ You are an expert software programmer.
 """
     humanmessage = f"""
 Your task:
-{state.get("tasks", [])[0] if state.get("tasks") else "No tasks yet."}
+{state.get("task", "No tasks yet.")}
 
 Do the task but DO NOT write the tests for it, the tests will be done by another agent. Focus only on the implementation.
 DO NOT run the tests, an evaluator will do it. Make corrections based on feedback from the evaluator.
-When it's done, just reply DONE.
+When it's done, just reply DONE
 
 You can find info about the project at store.json.
 You can query code structure with the graph tools.
@@ -164,7 +208,7 @@ Your log (last is most recent):
             timeout=300
         )
         usage = response.response_metadata.get("token_usage", {})
-        node_completed = "DONE" in remove_think_tags(get_content(response))
+        node_completed = "DONE" == remove_think_tags(get_content(response))
         return {
             "active_node": "programmer",
             "node_messages": {
@@ -187,11 +231,11 @@ You are an expert software tester.
 """
     humanmessage = f"""
 Your task:
-{state.get("tasks", [])[0] if state.get("tasks") else "No tasks yet."}
+{state.get("task", "No tasks yet.")}
 
 ONLY write tests for the task if they are needed, DO NOT implement the actual code, another agent is doing that.
 DO NOT run the tests, an evaluator will do it. Make corrections based on feedback from the evaluator.
-When it's done, just reply DONE.
+When it's done, just reply DONE
 
 You can find info about the project at store.json.
 You can query code structure with the graph tools.
@@ -209,7 +253,7 @@ Your log (last is most recent):
             timeout=300
         )
         usage = response.response_metadata.get("token_usage", {})
-        node_completed = "DONE" in remove_think_tags(get_content(response))
+        node_completed = "DONE" == remove_think_tags(get_content(response))
         return {
             "active_node": "testwriter",
             "node_messages": {
@@ -233,7 +277,7 @@ For vitest, always use 'npx vitest run' or 'npm test -- --run' to avoid watch mo
 """
     humanmessage = f"""
 Current task:
-{state.get("tasks", [])[0] if state.get("tasks") else "No tasks yet."}
+{state.get("task", "No tasks yet.")}
 
 If the current task has tests, run them without cache and check if they pass.
 You can use any tools available to run the tests and check results, but DO NOT modify the code or tests, just run them and observe the output.
@@ -361,15 +405,10 @@ async def tool_node(state: AgentState):
 
 async def context_cleaner_node(state: AgentState):
     print("*****************CLEANING CONTEXT*******************")
-    tasks = state.get("tasks", [])
-    new_tasks = tasks[1:] if tasks else []
-    finished = new_tasks == []
     return {
         "node_messages": {
             k: [] for k in state["node_messages"].keys()
         },
-        "tasks": new_tasks,
-        "finished": finished,
         "passed": False,
         "reflection_count": 0
     }
