@@ -101,10 +101,9 @@ Your job is to plan the development of a software codebase.
 The start.md file are the requirements the system must meet. Read it and
 explore the current state of the workspace to concisely divide the code implementation into tasks.
 If a task's results are reasonably testable programatically, describe how it should be tested.
-Describe the folder and file structure. Write the plan details to store.json, which will persist across loops.
-Decide the current task based on the state of the workspace.
-When planning is done but the codebase is not ready yet, reply PLANNING_DONE
-When the codebase mirrors the start.md requirements, reply PROJECT_DONE
+Describe the folder and file structure. Write the plan details to store.json (check syntax is valid), which will persist across loops.
+Decide the current task based on the state of the workspace, you can modify existing tasks if needed so that the codebase mirrors the requirements.
+File structure is critical, the project cannot be finished until every file in the requirements spec exists and is implemented.
 
 store.json expected schema:
 {{
@@ -124,9 +123,9 @@ store.json expected schema:
     }}
 }}
 
-Your expected response schema:
+Your expected response schema when store.json is written:
 {{
-    "status": "PLANNING_DONE|PROJECT_DONE"
+    "status": "PLANNING_DONE|PROJECT_DONE"  #When planning is done but the codebase is not ready yet, reply PLANNING_DONE When the codebase mirrors the start.md requirements, reply PROJECT_DONE
 }}
 
 Your log (last is most recent):

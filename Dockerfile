@@ -14,8 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 RUN mkdir -p /app/workspace
+RUN mkdir -p /.codegraph && chmod 777 /.codegraph
 
 ENV PYTHONUNBUFFERED=1
+ENV HOME=/tmp
 
 COPY entrypoint.sh /app/entrypoint.sh
 

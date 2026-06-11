@@ -85,7 +85,7 @@ graph.add_node("compactor", nodes.compactor_node)
 graph.add_edge(START, "planner")
 graph.add_edge("context_cleaner", "planner")
 
-graph.add_conditional_edges("planner", route_planner, ["tool_node", "programmer", "planner", "compactor"])
+graph.add_conditional_edges("planner", route_planner, ["tool_node", "programmer", "planner", "compactor", END])
 graph.add_conditional_edges("testwriter", route_testwriter, ["tool_node", "evaluator", "testwriter", "compactor"])
 graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "programmer", "evaluator", "testwriter", "compactor"])
 graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "testwriter", "context_cleaner", "evaluator", "compactor"])
