@@ -29,9 +29,10 @@ class AgentState(TypedDict):
     input_tokens: int
     output_tokens: int
     fixing: bool
-    fault: str
+    blame: str
     task: str
     timeout: bool
+    model_error: bool
     finished: bool
     node_completed: bool
     active_node: Literal["testwriter", "programmer", "planner", "evaluator"]
@@ -44,31 +45,46 @@ testwriter_model = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=minimax_a
 programmer_model = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=minimax_api_key, base_url=BASE_URL)
 evaluator_model = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=minimax_api_key, base_url=BASE_URL)
 planner_model = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=minimax_api_key, base_url=BASE_URL)
+entrypoint_model = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=minimax_api_key, base_url=BASE_URL)
 compactor_model = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=minimax_api_key, base_url=BASE_URL)
 
 cg_tools = tools.codegraph_tools
 
-all_tools = [tools.read_file, tools.bash, tools.write_file, tools.str_replace, *cg_tools]
+all_tools = [tools.read_file, tools.bash, tools.write_file, tools.str_replace]
 tools_by_name = {tool.name: tool for tool in all_tools}
 
-worker_tools = [tools.read_file, tools.write_file, tools.str_replace, tools.bash, *cg_tools]
+worker_tools = [tools.read_file, tools.write_file, tools.str_replace, tools.bash]
 evaluator_tools = [tools.read_file, tools.bash, *cg_tools]
-planner_tools = [tools.read_file, tools.write_file, tools.str_replace, tools.bash, *cg_tools]
+planner_tools = [tools.read_file, tools.write_file, tools.str_replace, tools.bash]
 
 testwriter_model = testwriter_model.bind_tools(worker_tools)
 programmer_model = programmer_model.bind_tools(worker_tools)
 evaluator_model = evaluator_model.bind_tools(evaluator_tools)
 planner_model = planner_model.bind_tools(planner_tools)
+entrypoint_model = entrypoint_model.bind_tools(planner_tools)
 
-def remove_think_tags(text: str) -> str:
+def get_content(message) -> str:
+    if isinstance(message.content, str):
+        return message.content
+
+    if isinstance(message.content, list):
+        return "".join(
+            block.get("text", "")
+            for block in message.content
+            if isinstance(block, dict)
+        )
+    return ""
+
+
+def remove_think_from_content(text: str) -> str:
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
-def get_content(response) -> str:
-    if isinstance(response.content, str):
-        return response.content
-    if isinstance(response.content, list) and response.content:
-        return response.content[0].get("text", "")
-    return ""
+
+def remove_think_from_message(message: AIMessage) -> AIMessage:
+    cleaned_content = remove_think_from_content(get_content(message))
+    msg = message.model_copy()
+    msg.content = cleaned_content
+    return msg
 
 
 def format_messages(state: AgentState, node: str) -> str:
@@ -91,45 +107,137 @@ def format_messages(state: AgentState, node: str) -> str:
     return "\n\n".join(lines)
 
 
+async def entrypoint_node(state: AgentState):
+    systemprompt = """
+You are a reliable assistant.
+You DON'T implement code.
+"""
+    humanmessage = f"""
+Read start.md.
+
+Create specification/.
+
+Split the specification into logically independent markdown files.
+
+Requirements:
+- Preserve ALL information.
+- Do NOT summarize.
+- Do NOT omit details.
+- Each requirement must appear exactly once.
+- Group related requirements together.
+- Create an index.md listing all generated files and their contents.
+
+finally, delete start.md and make sure it does not exist anymore.
+Reply {{"status":"DONE"}} when finished.
+
+Log: {format_messages(state, 'entrypoint')}
+"""
+    print(f'entry PROMPT: {humanmessage}')
+    try:
+        response = await asyncio.wait_for(
+            entrypoint_model.ainvoke([
+                SystemMessage(content=systemprompt),
+                HumanMessage(content=humanmessage)
+            ]),
+            timeout=300
+        )
+        usage = response.response_metadata.get("token_usage", {})
+        cleaned_response = remove_think_from_message(response)
+        node_completed = False
+        try:
+            status = json.loads(remove_think_from_content(get_content(response)))
+            node_completed = status['status'] == 'DONE'
+        except Exception as e:
+            pass
+        
+        return {
+            "active_node": "entrypoint",
+            "node_messages": {
+                **state["node_messages"],
+                "entrypoint": state["node_messages"].get("entrypoint", []) + [cleaned_response] if not node_completed else []
+            },
+            "node_completed": node_completed,
+            "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
+            "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+            "timeout": False
+        }
+    except asyncio.TimeoutError:
+        print("entrynode TIMEOUT")
+        return {"passed": False, 
+                "node_completed": False,
+                "timeout": True}
+    except Exception as e:
+        print(f"MODEL ERROR: {e}")
+
+        return {
+            "timeout": False,
+            "node_completed": False,
+            "model_error": True
+        }
+
+
 async def planner_node(state: AgentState):
     systemprompt = """
 You are a senior software engineer who plans and manages tasks in the codebase.
 You DON'T implement code.
 """
+
     humanmessage = f"""
-Your job is to plan the development of a software codebase.
-The start.md file are the requirements the system must meet. Read it and
-explore the current state of the workspace to concisely divide the code implementation into tasks.
-If a task's results are reasonably testable programatically, describe how it should be tested.
-Describe the folder and file structure. Write the plan details to store.json (check syntax is valid), which will persist across loops.
-Decide the current task based on the state of the workspace, you can modify existing tasks if needed so that the codebase mirrors the requirements.
-File structure is critical, the project cannot be finished until every file in the requirements spec exists and is implemented.
+Based on the specification/ and the current workspace state, do:
+1. Write store.json with the immediate current task (schema below)
+2. Reply with {{"status": "PROJECT_DONE"}} when the codebase is exactly
+as specified in start.md and you've validated JSON syntax is correct, it is mandatory that every file mentioned must exist
+in the workspace. 
+3. If the workspace is still not finished, update the plan as needed and reply {{"status": "PLANNING_DONE"}}, JUST THE JSON, no additional text.
 
-store.json expected schema:
+store.json schema:
 {{
-    "project_info": dict with any relevant info about the project (e.g. programming language, framework, libraries, etc) that can be useful for implementation and testing,
+    "project_info": {{}},
+    "already_done": "description of completed tasks",
     "current_task": {{
-            "task": "Short task description, function signature if applicable, and any relevant details for implementation.",
-            "test_instructions": "Instructions to implement the test for this task, including any relevant comments from the test file."
-            "mentioned_files": ["list", "of", "files", "relevant", "to", "this", "task", "for", "implementation"]
-    }}
-    "upcoming_tasks": [ tasks like current_task ],
-    "file_structure": {{
-        "folder1": {{
-            "subfolder1": ["file1.py", "file2.py"],
-            ...
-        }},
-        ...
-    }}
+        "implementation_spec": "Programmer instructions, DONT REDIRECT TO THE SPEC FILE, write everything needed to know here.",
+        "tests_spec": "Testwriter instructions, DONT REDIRECT TO THE SPEC FILE, write everything needed to know here.",
+        "test_steps": "What the evaluator must do to run the tests",
+        "mentioned_files": []
+    }},
+    "file_structure": {{}}
 }}
 
-Your expected response schema when store.json is written:
-{{
-    "status": "PLANNING_DONE|PROJECT_DONE"  #When planning is done but the codebase is not ready yet, reply PLANNING_DONE When the codebase mirrors the start.md requirements, reply PROJECT_DONE
-}}
+Task rules:
 
-Your log (last is most recent):
-{format_messages(state, 'planner')}
+1. A task may modify at most:
+   - 1 source file
+   - 1 test file
+
+2. A task may introduce at most:
+   - 1 class, OR
+   - 1 enum, OR
+   - 3 closely related functions
+
+3. A task must be independently testable.
+   The evaluator must be able to determine PASS/FAIL
+   without requiring future tasks.
+
+4. NEVER assign an entire module as a task.
+
+Bad:
+- Implement all of module/_file.py
+
+Good:
+- Add ArguablyException and ArguablyWarning
+- Add NoDefault and NO_DEFAULT
+- Add InputMethod enum
+- Add normalize_action_input()
+- Add camel_case_to_kebab_case()
+- Add split_unquoted()
+
+5. implementation_spec must contain only the information required
+   for the current task, not the entire module specification.
+
+6. mentioned_files must contain only the files needed
+   for the current task.
+
+Log: {format_messages(state, 'planner')}
 """
     print(f'PLANNER PROMPT: {humanmessage}')
     try:
@@ -146,25 +254,48 @@ Your log (last is most recent):
         finished = False
         task = ''
 
-        cleaned = remove_think_tags(get_content(response))
+        cleaned_response = remove_think_from_message(response)
+        cleaned_content = cleaned_response.content
         try:
-            cleaned = json.loads(cleaned)
+            cleaned_content = json.loads(cleaned_content)
         except Exception as e:
             pass
-        if isinstance(cleaned, dict):
+        if isinstance(cleaned_content, dict):
             print(get_content(response))
-            if cleaned.get('status', '') == "PLANNING_DONE":
-                plan = json.load(open("workspace/store.json"))
-                task = plan.get("current_task", '')
-                node_completed = True
-            if cleaned.get('status', '') == "PROJECT_DONE":
+            if cleaned_content.get("status") == "PLANNING_DONE":
+                try:
+                    with open("workspace/store.json") as f:
+                        plan = json.load(f)
+
+                    task = plan.get("current_task", "")
+                    node_completed = True
+
+                except Exception as e:
+                    print(f"Invalid store.json: {e}")
+
+                    return {
+                        "active_node": "planner",
+                        "node_messages": {
+                            **state["node_messages"],
+                            "planner": (
+                                state["node_messages"].get("planner", [])
+                                + [
+                                    HumanMessage(
+                                        content=f"store.json contains invalid JSON: {e}. Fix it."
+                                    )
+                                ]
+                            ),
+                        },
+                        "timeout": False,
+                    }
+            if cleaned_content.get('status', '') == "PROJECT_DONE":
                 finished = True
 
         return {
             "active_node": "planner",
             "node_messages": {
                 **state["node_messages"],
-                "planner": state["node_messages"].get("planner", []) + [response]
+                "planner": state["node_messages"].get("planner", []) + [cleaned_response]
             },
             "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
             "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
@@ -177,6 +308,14 @@ Your log (last is most recent):
         print("PLANNER TIMEOUT")
         return {"passed": False,
                 "timeout": True}
+    except Exception as e:
+        print(f"MODEL ERROR: {e}")
+
+        return {
+            "timeout": False,
+            "node_completed": False,
+            "model_error": True
+        }
 
 
 async def programmer_node(state: AgentState):
@@ -185,14 +324,15 @@ You are an expert software programmer.
 """
     humanmessage = f"""
 Your task:
-{state.get("task", "No tasks yet.")}
+{state.get("task", {}).get('implementation_spec', "no task yet")}
 
-Do the task but DO NOT write the tests for it, the tests will be done by another agent. Focus only on the implementation.
+Allowed files:
+{state.get("task", {}).get('mentioned_files', '')}
+
+Do the implementation spec and ONLY that.
 DO NOT run the tests, an evaluator will do it. Make corrections based on feedback from the evaluator.
-When it's done, just reply DONE
-
-You can find info about the project at store.json.
-You can query code structure with the graph tools.
+You are COMPLETELY FORBIDDEN from reading ANYTHING outside the allowed files list.
+Reply with {{"status": "DONE"}} when you are done, JUST THE JSON, no additional text.
 
 Your log (last is most recent):
 {format_messages(state, 'programmer')}
@@ -207,12 +347,19 @@ Your log (last is most recent):
             timeout=300
         )
         usage = response.response_metadata.get("token_usage", {})
-        node_completed = "DONE" == remove_think_tags(get_content(response))
+        cleaned_response = remove_think_from_message(response)
+        node_completed = False
+        try:
+            status = json.loads(remove_think_from_content(get_content(response)))
+            node_completed = status['status'] == 'DONE'
+        except Exception as e:
+            pass
+        
         return {
             "active_node": "programmer",
             "node_messages": {
                 **state["node_messages"],
-                "programmer": state["node_messages"].get("programmer", []) + [response] if not node_completed else []
+                "programmer": state["node_messages"].get("programmer", []) + [cleaned_response] if not node_completed else []
             },
             "node_completed": node_completed,
             "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
@@ -221,7 +368,18 @@ Your log (last is most recent):
         }
     except asyncio.TimeoutError:
         print("programmer TIMEOUT")
-        return {"passed": False, "timeout": True}
+        return {"passed": False, 
+                "node_completed": False,
+                "timeout": True}
+    except Exception as e:
+        print(f"MODEL ERROR: {e}")
+
+        return {
+            "timeout": False,
+            "node_completed": False,
+            "model_error": True
+        }
+
 
 
 async def testwriter_node(state: AgentState):
@@ -230,14 +388,15 @@ You are an expert software tester.
 """
     humanmessage = f"""
 Your task:
-{state.get("task", "No tasks yet.")}
+{state.get("task", {}).get('tests_spec', "no task yet")}
 
-ONLY write tests for the task if they are needed, DO NOT implement the actual code, another agent is doing that.
+Allowed files:
+{state.get("task", {}).get('mentioned_files', '')}
+
+Do the tests spec and ONLY that.
 DO NOT run the tests, an evaluator will do it. Make corrections based on feedback from the evaluator.
-When it's done, just reply DONE
-
-You can find info about the project at store.json.
-You can query code structure with the graph tools.
+You are COMPLETELY FORBIDDEN from reading ANYTHING outside the allowed files list.
+Reply with {{"status": "DONE"}} when you are done. JUST THE JSON, no additional text.
 
 Your log (last is most recent):
 {format_messages(state, 'testwriter')}
@@ -252,12 +411,19 @@ Your log (last is most recent):
             timeout=300
         )
         usage = response.response_metadata.get("token_usage", {})
-        node_completed = "DONE" == remove_think_tags(get_content(response))
+        cleaned_response = remove_think_from_message(response)
+
+        node_completed = False
+        try:
+            status = json.loads(remove_think_from_content(get_content(response)))
+            node_completed = status['status'] == 'DONE'
+        except Exception as e:
+            pass
         return {
             "active_node": "testwriter",
             "node_messages": {
                 **state["node_messages"],
-                "testwriter": state["node_messages"].get("testwriter", []) + [response] if not node_completed else []
+                "testwriter": state["node_messages"].get("testwriter", []) + [cleaned_response] if not node_completed else []
             },
             "node_completed": node_completed,
             "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
@@ -266,7 +432,17 @@ Your log (last is most recent):
         }
     except asyncio.TimeoutError:
         print("testwriter TIMEOUT")
-        return {"passed": False, "timeout": True}
+        return {"passed": False, 
+                "node_completed": False,
+                "timeout": True}
+    except Exception as e:
+        print(f"MODEL ERROR: {e}")
+
+        return {
+            "timeout": False,
+            "node_completed": False,
+            "model_error": True
+        }
 
 
 async def evaluator_node(state: AgentState):
@@ -278,17 +454,17 @@ For vitest, always use 'npx vitest run' or 'npm test -- --run' to avoid watch mo
 Current task:
 {state.get("task", "No tasks yet.")}
 
-If the current task has tests, run them without cache and check if they pass.
-You can use any tools available to run the tests and check results, but DO NOT modify the code or tests, just run them and observe the output.
-You can find info about the project at store.json.
-You can query code structure with the graph tools.
+Follow the testing instructions.
+Determine if the task has been completed, and whose blame it is if not.
+You are COMPLETELY FORBIDDEN from reading ANYTHING outside the allowed files list.
 
-If the tests pass or they aren't needed, reply with GOOD. If they fail, determine whose fault it is, the PROGRAMMER or the TESTWRITER and
-reply with the output. DO NOT attempt to fix, just report.
-
-Example fail response:
-TESTWRITER
-[stacktrace here]
+Example response (ONLY VALID JSON):
+{{
+    "status": "FAIL|PASS",
+    "blame": "PROGRAMMER|TESTWRITER|(empty if passed)",
+    "stacktrace": "failure trace, empty if passed",
+    "reason": "explanation of failure, empty if passed"
+}}
 
 Your log (last is most recent):
 {format_messages(state, 'evaluator')}
@@ -303,31 +479,56 @@ Your log (last is most recent):
             timeout=300
         )
         usage = response.response_metadata.get("token_usage", {})
-        content = remove_think_tags(get_content(response))
-
-        passed = "GOOD" in content
-        fault = "testwriter" if "TESTWRITER" in content else "programmer" if "PROGRAMMER" in content else ""
-        evaluation_ended = passed or (fault != "")
+        cleaned_response = remove_think_from_message(response)
+        cleaned_content = cleaned_response.content
         
-        response_copy = response.model_copy()
-        response_copy.content = "The evaluator says: " + content
+        passed = False
+        blame = ""
+        try:
+            status = json.loads(cleaned_content)
+            passed = status.get("status", "").strip().upper() == "PASS"
+            blame = status.get("blame", "").strip().lower()
+            if blame not in ("programmer", "testwriter"):
+                blame = ""
+        except Exception as e:
+            pass
+        evaluation_ended = passed or (blame != "")
+        
+        response_copy = cleaned_response.model_copy()
+        response_copy.content = "The evaluator says: " + cleaned_content
+
+        node_messages = {
+            **state["node_messages"],
+            "evaluator": state["node_messages"].get("evaluator", []) + [cleaned_response] if not evaluation_ended else [],
+        }
+        if blame:
+            node_messages[blame] = (
+                state["node_messages"].get(blame, []) + [response_copy]
+            )
         return {
             "active_node": "evaluator",
-            "node_messages": {
-                **state["node_messages"],
-                "evaluator": state["node_messages"].get("evaluator", []) + [response] if not evaluation_ended else [],
-                fault: state["node_messages"].get(fault, []) + [response_copy],
-            },
+            "node_messages": node_messages,
             "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
             "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
             "passed": passed,
-            "fault": fault,
+            "blame": blame,
             "reflection_count": state.get("reflection_count", 0) + 1,
             "timeout": False
         }
     except asyncio.TimeoutError:
         print("EVALUATOR TIMEOUT")
-        return {"passed": False, "timeout": True}
+        return {"passed": False, 
+                "node_completed": False,
+                "blame": '',
+                "timeout": True}
+    except Exception as e:
+        print(f"MODEL ERROR: {e}")
+
+        return {
+            "timeout": False,
+            "node_completed": False,
+            "model_error": True
+        }
 
 
 
@@ -352,19 +553,28 @@ The log to compact (last is most recent):
             timeout=300
         )
         usage = response.response_metadata.get("token_usage", {})
+        cleaned_response = remove_think_from_message(response)
         active_node = state['active_node']
         return {
             "node_messages": {
                 **state["node_messages"],
-                active_node: [response]
+                active_node: [cleaned_response]
             },
             "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
             "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
-            "timeout": False
+            "timeout": False,
         }
     except asyncio.TimeoutError:
         print("compactor TIMEOUT")
         return {"passed": False, "timeout": True}
+    except Exception as e:
+        print(f"MODEL ERROR: {e}")
+
+        return {
+            "timeout": False,
+            "node_completed": False,
+            "model_error": True
+        }
 
 
 
@@ -409,5 +619,7 @@ async def context_cleaner_node(state: AgentState):
             k: [] for k in state["node_messages"].keys()
         },
         "passed": False,
-        "reflection_count": 0
+        "blame": "",
+        "reflection_count": 0,
+        "node_completed": False
     }

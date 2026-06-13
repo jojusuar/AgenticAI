@@ -76,6 +76,8 @@ def bash(command: str, timeout: int = 900) -> str:
     """
     if "cd " in command:
         return "Error: changing directories is not allowed"
+    if "wget " in command:
+        return "Error: downloading from internet is not allowed"
     result = subprocess.run(
         command,
         shell=True,
