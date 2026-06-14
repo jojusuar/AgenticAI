@@ -10,9 +10,9 @@ import time
 import subprocess
 
 MAX_REFLECTION_LOOPS = 3
-MAX_CONTEXT_MESSAGES = 20
-MAX_INPUT_TOKENS = 5000000
-MAX_OUTPUT_TOKENS = 500000
+MAX_CONTEXT_MESSAGES = 30
+MAX_INPUT_TOKENS = 3000000
+MAX_OUTPUT_TOKENS = 200000
 
 def budget_exceeded(state: nodes.AgentState) -> bool:
     return (
@@ -20,51 +20,11 @@ def budget_exceeded(state: nodes.AgentState) -> bool:
         or state.get("output_tokens", 0) >= MAX_OUTPUT_TOKENS
     )
 
-def route_tool_response(state: nodes.AgentState) -> Literal["entrypoint", "testwriter", "programmer", "planner", "evaluator"]:
+def route_tool_response(state: nodes.AgentState) -> Literal["programmer", "evaluator", "compactor"]:
     return state["active_node"]
 
 
-def route_entrypoint(state: nodes.AgentState) -> Literal["entrypoint", "planner", "tool_node"]:
-    log = state["node_messages"].get("entrypoint", [])
-    last_message = log[-1] if log else None
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "tool_node"
-    if state['node_completed']:
-        return "planner"
-    return "entrypoint"
-
-
-def route_planner(state: nodes.AgentState) -> Literal["tool_node", "programmer", "planner", "compactor", END]:
-    if budget_exceeded(state):
-        return END
-    log = state["node_messages"].get("planner", [])
-    last_message = log[-1] if log else None
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "tool_node"
-    if state['node_completed']:
-        return "programmer"
-    if state.get("timeout") or state.get('model_error'):
-        return "compactor"
-    if state.get("finished"):
-        return END
-    return "planner"
-
-
-def route_testwriter(state: nodes.AgentState) -> Literal["tool_node", "evaluator", "testwriter", "compactor", END]:
-    if budget_exceeded(state):
-        return END
-    log = state["node_messages"].get("testwriter", [])
-    last_message = log[-1] if log else None
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "tool_node"
-    if state['node_completed']:
-        return "evaluator"
-    if state.get("timeout") or state.get('model_error') or len(log) >= MAX_CONTEXT_MESSAGES:
-        return "compactor"
-    return "testwriter"
-
-
-def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "testwriter", "compactor", END]:
+def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", END]:
     if budget_exceeded(state):
         return END
     log = state["node_messages"].get("programmer", [])
@@ -72,54 +32,41 @@ def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programme
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
     if state['node_completed']:
-        if state['blame'] == "programmer":
-            return "evaluator"
-        return "testwriter"
-    if state.get("timeout") or state.get('model_error') or len(log) >= MAX_CONTEXT_MESSAGES:
+        return "evaluator"
+    if state.get("timeout") or state.get('model_error'):
         return "compactor"
     return "programmer"
 
-def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "testwriter", "evaluator", "context_cleaner", "compactor", END]:
-    if budget_exceeded(state):
+def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", END]:
+    if budget_exceeded(state) or state.get("reflection_count") >= MAX_REFLECTION_LOOPS:
         return END
     log = state["node_messages"].get("evaluator", [])
     last_message = log[-1] if log else None
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
-    if state.get("passed") or state.get("reflection_count") >= MAX_REFLECTION_LOOPS:
-        return "context_cleaner"
-    blame = state.get("blame")
-    if blame:
-        return blame
-    if state.get("timeout") or state.get('model_error') or len(log) >= MAX_CONTEXT_MESSAGES:
+    if state.get("passed"):
+        return END
+    if state.get("timeout") or state.get('model_error'):
         return "compactor"
-    return "evaluator"
+    return "programmer"
 
-def route_compactor(state: nodes.AgentState) -> Literal["testwriter", "programmer", "planner", "evaluator", END]:
+def route_compactor(state: nodes.AgentState) -> Literal["programmer", "evaluator", "compactor", END]:
     if budget_exceeded(state):
         return END
     return state["active_node"]
 
 graph = StateGraph(nodes.AgentState)
-graph.add_node('entrypoint', nodes.entrypoint_node)
-graph.add_node("planner", nodes.planner_node)
-graph.add_node("testwriter", nodes.testwriter_node, retry_policy=RetryPolicy(max_attempts=1))
 graph.add_node("programmer", nodes.programmer_node, retry_policy=RetryPolicy(max_attempts=1))
 graph.add_node("evaluator", nodes.evaluator_node)
 graph.add_node("tool_node", nodes.tool_node)
-graph.add_node("context_cleaner", nodes.context_cleaner_node)
 graph.add_node("compactor", nodes.compactor_node)
 
-graph.add_edge(START, "entrypoint")
-graph.add_edge("context_cleaner", "planner")
+graph.add_edge(START, "programmer")
 
-graph.add_conditional_edges("entrypoint", route_entrypoint, ["entrypoint", "planner", "tool_node"])
-graph.add_conditional_edges("planner", route_planner, ["tool_node", "programmer", "planner", "compactor", END])
-graph.add_conditional_edges("testwriter", route_testwriter, ["tool_node", "evaluator", "testwriter", "compactor", END])
-graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "programmer", "evaluator", "testwriter", "compactor", END])
-graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "testwriter", "context_cleaner", "evaluator", "compactor", END])
-graph.add_conditional_edges("tool_node", route_tool_response, ["entrypoint", "testwriter", "programmer", "planner", "evaluator", "compactor"])
-graph.add_conditional_edges("compactor", route_compactor, ["testwriter", "programmer", "planner", "evaluator", "compactor", END])
+graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "programmer", "evaluator", "compactor", END])
+graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "evaluator", "compactor", END])
+graph.add_conditional_edges("tool_node", route_tool_response, ["programmer", "evaluator", "compactor"])
+graph.add_conditional_edges("compactor", route_compactor, ["programmer", "evaluator", "compactor", END])
 
 agent = graph.compile()
 
@@ -167,11 +114,6 @@ if __name__ == "__main__":
 
 
 # IDEAS:
-# usar esta arch con store.json como baseline agentico (solo usar el modelo + tool calls podria ser visto como ventaja trivial para nuestra propuesta)
-# implementar otra arch sin persistencia en el workspace, sino con memorias en db vectorial / knowledge graph / priority queues etc para componer el contexto
-# comparar https://llm-stats.com/benchmarks/nl2repo estos modelos solitos vs arch con store.json vs arch con memoria real
-# eso deberia resaltar la ganancia causada por la memoria
-
 # tal vez el approach de cache jerarquico es el mejor?
 # con un ponderado entre lru y lfu como politica?
 # investigar papers sobre nuevas politicas de manejo de memoria
