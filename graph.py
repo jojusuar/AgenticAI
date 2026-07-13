@@ -8,11 +8,12 @@ import sys
 import json
 import time
 import subprocess
+from memory import MyMemory
 
-MAX_REFLECTION_LOOPS = 3
+MAX_REFLECTION_LOOPS = 50
 MAX_CONTEXT_MESSAGES = 30
-MAX_INPUT_TOKENS = 3000000
-MAX_OUTPUT_TOKENS = 200000
+MAX_INPUT_TOKENS = 20000000
+MAX_OUTPUT_TOKENS = 1000000
 
 def budget_exceeded(state: nodes.AgentState) -> bool:
     return (
@@ -20,14 +21,28 @@ def budget_exceeded(state: nodes.AgentState) -> bool:
         or state.get("output_tokens", 0) >= MAX_OUTPUT_TOKENS
     )
 
-def route_tool_response(state: nodes.AgentState) -> Literal["programmer", "evaluator", "compactor"]:
-    return state["active_node"]
+def route_tool_response(state: nodes.AgentState) -> Literal["planner", "programmer", "evaluator", "compactor"]:
+    return state.get('active_node')
 
+def route_planner(state: nodes.AgentState) -> Literal["tool_node", "programmer", "planner", "compactor", END]:
+    if budget_exceeded(state):
+        return END
+    memory = state.get('memory')
+    log = memory.l1.get("planner", [])
+    last_message = log[-1] if log else None
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        return "tool_node"
+    if state['node_completed']:
+        return "programmer"
+    if state.get("timeout") or state.get('model_error'):
+        return "compactor"
+    return "planner"
 
 def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", END]:
     if budget_exceeded(state):
         return END
-    log = state["node_messages"].get("programmer", [])
+    memory = state.get('memory')
+    log = memory.l1.get("programmer", [])
     last_message = log[-1] if log else None
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
@@ -37,15 +52,16 @@ def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programme
         return "compactor"
     return "programmer"
 
-def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", END]:
+def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", "memory_operator", END]:
     if budget_exceeded(state) or state.get("reflection_count") >= MAX_REFLECTION_LOOPS:
         return END
-    log = state["node_messages"].get("evaluator", [])
+    memory = state.get('memory')
+    log = memory.l1.get("evaluator", [])
     last_message = log[-1] if log else None
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
     if state.get("passed"):
-        return END
+        return "memory_operator"
     if state.get("timeout") or state.get('model_error'):
         return "compactor"
     return "programmer"
@@ -53,29 +69,38 @@ def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer
 def route_compactor(state: nodes.AgentState) -> Literal["programmer", "evaluator", "compactor", END]:
     if budget_exceeded(state):
         return END
-    return state["active_node"]
+    return state.get('active_node')
+
+def route_memory_operator(state: nodes.AgentState) -> Literal["programmer", END]:
+    if state.get('finished'):
+        return END
+    return state.get('active_node')
+
 
 graph = StateGraph(nodes.AgentState)
+graph.add_node("planner", nodes.planner_node, retry_policy=RetryPolicy(max_attempts=1))
 graph.add_node("programmer", nodes.programmer_node, retry_policy=RetryPolicy(max_attempts=1))
-graph.add_node("evaluator", nodes.evaluator_node)
+graph.add_node("evaluator", nodes.evaluator_node, retry_policy=RetryPolicy(max_attempts=1))
 graph.add_node("tool_node", nodes.tool_node)
-graph.add_node("compactor", nodes.compactor_node)
+graph.add_node("memory_operator", nodes.memory_operator_node, retry_policy=RetryPolicy(max_attempts=1))
+graph.add_node("compactor", nodes.compactor_node, retry_policy=RetryPolicy(max_attempts=1))
 
-graph.add_edge(START, "programmer")
+graph.add_edge(START, "planner")
 
+graph.add_conditional_edges("planner", route_planner, ["tool_node", "programmer", "planner", "compactor", END])
 graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "programmer", "evaluator", "compactor", END])
-graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "evaluator", "compactor", END])
-graph.add_conditional_edges("tool_node", route_tool_response, ["programmer", "evaluator", "compactor"])
+graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "evaluator", "compactor", "memory_operator", END])
+graph.add_conditional_edges("tool_node", route_tool_response, ["planner", "programmer", "evaluator", "compactor"])
 graph.add_conditional_edges("compactor", route_compactor, ["programmer", "evaluator", "compactor", END])
+graph.add_conditional_edges("memory_operator", route_memory_operator, ["programmer", END])
 
 agent = graph.compile()
 
-async def runloop(prompt: str,):
+async def runloop(prompt: str):
     result = await agent.ainvoke({
-        "node_messages": {"planner": [HumanMessage(content=prompt)]},
+        "memory": MyMemory(),
         "reflection_count": 0,
         "finished": False,
-        "blame": '',
         "node_completed": False
     })
     return result
@@ -113,9 +138,4 @@ if __name__ == "__main__":
             codegraph.kill()
 
 
-# IDEAS:
-# tal vez el approach de cache jerarquico es el mejor?
-# con un ponderado entre lru y lfu como politica?
-# investigar papers sobre nuevas politicas de manejo de memoria
-
-# idea de titulo: MYARCH: Hierarchical agentic memory for ground-up codebase generation
+#Pullear todas las imagenes de test del benchmark, porsiaca las tumban
