@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -501,21 +502,28 @@ the log:
     
 
 
-async def memory_operator_node(state: AgentState):
+async def l2_operator_node(state: AgentState):
     memory: MyMemory = state.get('memory')
     current_task = state.get('current_task', {})
     input_tokens_total = state.get("input_tokens", 0)
     output_tokens_total = state.get("output_tokens", 0)
 
     if memory.monolithic:
-        return {
-            "passed": False
-        }
+        return {}
 
-    relevant_files = memory.relevant_files_for_task(current_task)
-    for path in relevant_files:
-        content = tools.read_file.invoke({"path": path})
-        if not content or content.startswith("[Errno") or content.startswith("Error"):
+    touched_files = sorted(memory.programmer_touched_files)
+    for path in touched_files:
+        try:
+            data = tools.safe_path(path).read_bytes()
+            content_hash = hashlib.sha256(data).hexdigest()
+            content = data.decode("utf-8")
+        except (OSError, UnicodeError) as e:
+            print(f"MEMORY OPERATOR L2 READ ERROR for {path}: {e}")
+            continue
+
+        if memory.l2_hashes.get(path) == content_hash:
+            memory.mark_l2_unchanged(path)
+            print(f"MEMORY OPERATOR L2 UNCHANGED {path}")
             continue
 
         prompt = f"""
@@ -554,25 +562,29 @@ File content:
                 print(f"MEMORY OPERATOR L2 MALFORMED JSON for {path}")
                 continue
             summary = parsed["summary"]
-            memory.update_l2(path, summary)
+            memory.complete_l2_update(path, content_hash, summary)
+            print(f"MEMORY OPERATOR L2 UPDATED {path}")
         except asyncio.TimeoutError:
             print(f"MEMORY OPERATOR L2 TIMEOUT for {path}")
         except Exception as e:
             print(f"MEMORY OPERATOR L2 ERROR for {path}: {e}")
 
-    l2_context = "\n\n".join(
-        f"{path}:\n{memory.l2[path]}"
-        for path in relevant_files
-        if path in memory.l2
-    )
-    task_log = "\n\n".join(
-        log
-        for log in (
-            memory.format_messages('programmer'),
-            memory.format_messages('evaluator'),
-        )
-        if log.strip()
-    )
+    return {
+        "input_tokens": input_tokens_total,
+        "output_tokens": output_tokens_total,
+    }
+
+
+async def l3_operator_node(state: AgentState):
+    memory: MyMemory = state.get('memory')
+    current_task = state.get('current_task', {})
+    input_tokens_total = state.get("input_tokens", 0)
+    output_tokens_total = state.get("output_tokens", 0)
+
+    if memory.monolithic or not state.get("passed"):
+        return {}
+
+    task_log = memory.format_messages('programmer')
     insight_prompt = f"""
 You are the L3 memory operator for an agentic code-generation harness.
 
@@ -605,16 +617,13 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
 Completed task:
 {current_task}
 
-Relevant module memory:
-{l2_context}
-
-Task transcript:
+Programmer L1 (includes evaluator feedback sent to the programmer):
 {task_log}
 """
     try:
         print(
             "MEMORY OPERATOR L3 START "
-            f"(task_log_chars={len(task_log)}, l2_chars={len(l2_context)}, stored={len(memory.l3)})"
+            f"(programmer_l1_chars={len(task_log)}, stored={len(memory.l3)})"
         )
         insight_response = await asyncio.wait_for(
             invoke_model(memory_operator_model, insight_prompt),
@@ -671,13 +680,20 @@ Insight:
 
     memory.clear_all_l1()
 
-    print('MEMORY OPERATOR entered, rerouting to planner')
+    print('MEMORY OPERATOR L3 entered, rerouting to planner')
 
     return {
         "passed": False,
         "input_tokens": input_tokens_total,
         "output_tokens": output_tokens_total
     }
+
+
+async def task_cleanup_node(state: AgentState):
+    """Discard task-scoped L1 after an abandoned task without creating L3 memory."""
+    memory: MyMemory = state.get('memory')
+    memory.clear_all_l1()
+    return {"passed": False}
 
 
 async def tool_node(state: AgentState):
@@ -694,6 +710,10 @@ async def tool_node(state: AgentState):
             observation = await tool.ainvoke(tool_call["args"])
             if tool_name in {"write_file", "str_replace"} and not str(observation).startswith("Error:"):
                 workspace_changed = True
+                if active == "programmer":
+                    path = tool_call.get("args", {}).get("path")
+                    if isinstance(path, str):
+                        memory.track_programmer_file(path)
         except ValidationError as e:
             observation = (
                 f"INVALID TOOL CALL\n\n"

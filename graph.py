@@ -8,6 +8,7 @@ import sys
 import json
 import time
 import subprocess
+from tools import WORKSPACE
 from memory import MyMemory
 
 MAX_FEEDBACK_LOOPS_PER_TASK = 3
@@ -54,7 +55,7 @@ def route_planner(state: nodes.AgentState) -> Literal["tool_node", "programmer",
         return "compactor"
     return "planner"
 
-def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", END]:
+def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "l2_operator", "compactor", END]:
     if should_end(state):
         return END
     memory = state.get('memory')
@@ -63,19 +64,21 @@ def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programme
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
     if state['node_completed']:
+        if not getattr(memory, "monolithic", False):
+            return "l2_operator"
         return "evaluator"
     if state.get("timeout") or state.get('model_error'):
         return "compactor"
     return "programmer"
 
-def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", "memory_operator", "planner", END]:
+def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", "l3_operator", "task_cleanup", "planner", END]:
     if should_end(state):
         return END
     memory = state.get('memory')
     if state.get("reflection_count") >= MAX_FEEDBACK_LOOPS_PER_TASK:
         if getattr(memory, "monolithic", False):
             return "planner"
-        return "memory_operator"
+        return "task_cleanup"
     log = memory.l1.get("evaluator", [])
     last_message = log[-1] if log else None
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -87,7 +90,7 @@ def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer
     if state.get("passed"):
         if getattr(memory, "monolithic", False):
             return "planner"
-        return "memory_operator"
+        return "l3_operator"
     return "programmer"
 
 def route_compactor(state: nodes.AgentState) -> Literal["planner", "programmer", "evaluator", "compactor", END]:
@@ -95,7 +98,7 @@ def route_compactor(state: nodes.AgentState) -> Literal["planner", "programmer",
         return END
     return state.get('active_node')
 
-def route_memory_operator(state: nodes.AgentState) -> Literal["planner", END]:
+def route_l3_operator(state: nodes.AgentState) -> Literal["planner", END]:
     if should_end(state) or state.get('finished'):
         return END
     return "planner"
@@ -106,17 +109,21 @@ graph.add_node("planner", nodes.planner_node, retry_policy=RetryPolicy(max_attem
 graph.add_node("programmer", nodes.programmer_node, retry_policy=RetryPolicy(max_attempts=1))
 graph.add_node("evaluator", nodes.evaluator_node, retry_policy=RetryPolicy(max_attempts=1))
 graph.add_node("tool_node", nodes.tool_node)
-graph.add_node("memory_operator", nodes.memory_operator_node, retry_policy=RetryPolicy(max_attempts=1))
+graph.add_node("l2_operator", nodes.l2_operator_node, retry_policy=RetryPolicy(max_attempts=1))
+graph.add_node("l3_operator", nodes.l3_operator_node, retry_policy=RetryPolicy(max_attempts=1))
+graph.add_node("task_cleanup", nodes.task_cleanup_node)
 graph.add_node("compactor", nodes.compactor_node, retry_policy=RetryPolicy(max_attempts=1))
 
 graph.add_edge(START, "planner")
 
 graph.add_conditional_edges("planner", route_planner, ["tool_node", "programmer", "planner", "compactor", END])
-graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "programmer", "evaluator", "compactor", END])
-graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "evaluator", "compactor", "memory_operator", "planner", END])
+graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "programmer", "evaluator", "l2_operator", "compactor", END])
+graph.add_edge("l2_operator", "evaluator")
+graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "evaluator", "compactor", "l3_operator", "task_cleanup", "planner", END])
+graph.add_edge("task_cleanup", "planner")
 graph.add_conditional_edges("tool_node", route_tool_response, ["planner", "programmer", "evaluator", "compactor", END])
 graph.add_conditional_edges("compactor", route_compactor, ["planner", "programmer", "evaluator", "compactor", END])
-graph.add_conditional_edges("memory_operator", route_memory_operator, ["planner", END])
+graph.add_conditional_edges("l3_operator", route_l3_operator, ["planner", END])
 
 agent = graph.compile()
 
@@ -152,19 +159,22 @@ async def runloop(prompt: str, memory: bool = True, l3_insights: int = L3_INSIGH
     return result
 
 if __name__ == "__main__":
-
-    codegraph = subprocess.Popen(
-        ["codegraph-mcp", "start"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    run_start_time = time.monotonic()
+    result = {}
+    run_error = None
+    codegraph = None
+    memory = True
+    l3_insights = L3_INSIGHTS
 
     try:
+        codegraph = subprocess.Popen(
+            ["codegraph-mcp", "start"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         time.sleep(3)
 
         prompt_file = sys.argv[1]
-        memory = True
-        l3_insights = L3_INSIGHTS
         for arg in sys.argv[2:]:
             if arg.startswith("memory="):
                 memory = parse_bool(arg.split("=", 1)[1])
@@ -179,20 +189,31 @@ if __name__ == "__main__":
             prompt = f.read()
 
         result = asyncio.run(runloop(prompt, memory=memory, l3_insights=l3_insights))
-
-        with open("/app/workspace/usage.json", "w") as f:
-            json.dump({
+    except BaseException as e:
+        run_error = e
+        raise
+    finally:
+        try:
+            usage = {
                 "input_tokens": result.get("input_tokens", 0),
                 "output_tokens": result.get("output_tokens", 0),
-            }, f)
-
-    finally:
-        codegraph.terminate()
-
-        try:
-            codegraph.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            codegraph.kill()
+                "elapsed_seconds": time.monotonic() - run_start_time,
+                "finished": result.get("finished", False),
+                "idle_timeout": result.get("idle_timeout", False),
+                "memory_enabled": memory,
+                "error_type": type(run_error).__name__ if run_error else None,
+                "error": str(run_error) if run_error else None,
+            }
+            WORKSPACE.mkdir(parents=True, exist_ok=True)
+            with open(WORKSPACE / "usage.json", "w") as f:
+                json.dump(usage, f, indent=2)
+        finally:
+            if codegraph is not None:
+                codegraph.terminate()
+                try:
+                    codegraph.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    codegraph.kill()
 
 
 #Pullear todas las imagenes de test del benchmark, porsiaca las tumban

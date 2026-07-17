@@ -1,6 +1,7 @@
 import math
 import os
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
 try:
@@ -76,6 +77,8 @@ class MyMemory:
         self.l3_insights = l3_insights
         self.l1 = MonolithicLog("all") if self.monolithic else {}
         self.l2 = {}
+        self.l2_hashes = {}
+        self.programmer_touched_files = set()
         self.l3 = []
 
     def add_self_message(self, message: AIMessage, node: str):
@@ -158,6 +161,25 @@ class MyMemory:
     def update_l2(self, path: str, summary: str):
         if summary.strip():
             self.l2[path] = summary.strip()
+
+    def track_programmer_file(self, path: str):
+        """Record a successfully mutated workspace-relative file for the next L2 pass."""
+        normalized = PurePosixPath(path.replace("\\", "/"))
+        if normalized.is_absolute() or ".." in normalized.parts:
+            return
+        self.programmer_touched_files.add(str(normalized))
+
+    def complete_l2_update(self, path: str, content_hash: str, summary: str):
+        """Commit summary and hash atomically after a successful L2 model response."""
+        summary = summary.strip()
+        if not summary:
+            return
+        self.l2[path] = summary
+        self.l2_hashes[path] = content_hash
+        self.programmer_touched_files.discard(path)
+
+    def mark_l2_unchanged(self, path: str):
+        self.programmer_touched_files.discard(path)
 
     def inject_l2(self, task: dict[str, Any], node: str) -> str:
         if node == "planner":
