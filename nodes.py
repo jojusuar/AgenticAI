@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from typing import Literal
 from langchain_core.messages import (
     AIMessage,
@@ -15,7 +16,7 @@ import tools
 from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
-from memory import MyMemory, remove_think_from_message
+from memory import MyMemory, OllamaEmbeddingError, remove_think_from_message
 
 
 load_dotenv()
@@ -31,6 +32,8 @@ class AgentState(TypedDict):
     passed: bool
     start_time: float
     elapsed_time: float
+    last_workspace_change_time: float
+    idle_timeout: bool
     input_tokens: int
     output_tokens: int
     timeout: bool
@@ -181,9 +184,31 @@ def normalize_planner_response(cleaned):
     return current_task, project_info, finished
 
 
+def get_token_usage(response):
+    metadata = response.response_metadata or {}
+    usage = metadata.get("token_usage") or metadata.get("usage") or {}
+    usage_metadata = getattr(response, "usage_metadata", None) or {}
+    input_tokens = (
+        usage.get("prompt_tokens")
+        or usage.get("input_tokens")
+        or usage_metadata.get("input_tokens")
+        or usage_metadata.get("prompt_tokens")
+        or 0
+    )
+    output_tokens = (
+        usage.get("completion_tokens")
+        or usage.get("output_tokens")
+        or usage_metadata.get("output_tokens")
+        or usage_metadata.get("completion_tokens")
+        or 0
+    )
+    return input_tokens, output_tokens
+
+
 async def planner_node(state: AgentState):
     memory: MyMemory = state.get('memory')
     node_name = 'planner'
+    current_task = state.get('current_task', {})
 
     prompt = f"""
 You are a senior software engineer who plans and manages tasks in the codebase.
@@ -216,7 +241,7 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
     }}
 }}
 
-{memory.inject(node_name)}
+{memory.inject(node_name, current_task)}
 """
     print(f'PLANNER PROMPT: {prompt}')
     try:
@@ -224,7 +249,7 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
             invoke_model(planner_model, prompt),
             timeout=300
         )
-        usage = response.response_metadata.get("token_usage", {})
+        input_tokens, output_tokens = get_token_usage(response)
         cleaned_response = remove_think_from_message(response)
         memory.add_self_message(cleaned_response.model_copy(), node_name)
         
@@ -234,8 +259,8 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
         if cleaned is PARSE_FAILED:
             return {
                 "active_node": node_name,
-                "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
-                "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+                "input_tokens": state.get("input_tokens", 0) + input_tokens,
+                "output_tokens": state.get("output_tokens", 0) + output_tokens,
                 "node_completed": False,
                 "timeout": False,
                 "model_error": False
@@ -256,8 +281,8 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
 
         return {
             "active_node":node_name,
-            "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
-            "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+            "input_tokens": state.get("input_tokens", 0) + input_tokens,
+            "output_tokens": state.get("output_tokens", 0) + output_tokens,
             "node_completed": node_completed,
             "timeout": False,
             "current_task": current_task,
@@ -301,7 +326,7 @@ You must fix what the evaluator tells you to if it gives feedback.
     
 Reply with {{"status": "DONE"}} when you are done, JUST THE JSON, no additional text or markdown fences.
 
-{memory.inject(node_name)}
+{memory.inject(node_name, current_task)}
 """
     print(f'{node_name} PROMPT: {prompt}')
     try:
@@ -310,7 +335,7 @@ Reply with {{"status": "DONE"}} when you are done, JUST THE JSON, no additional 
             timeout=300
         )
 
-        usage = response.response_metadata.get("token_usage", {})
+        input_tokens, output_tokens = get_token_usage(response)
         cleaned_response = remove_think_from_message(response)
         memory.add_self_message(cleaned_response.model_copy(), node_name)
 
@@ -320,8 +345,8 @@ Reply with {{"status": "DONE"}} when you are done, JUST THE JSON, no additional 
             return {
                 "active_node": node_name,
                 "node_completed": False,
-                "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
-                "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+                "input_tokens": state.get("input_tokens", 0) + input_tokens,
+                "output_tokens": state.get("output_tokens", 0) + output_tokens,
                 "timeout": False,
                 "model_error": False
             }
@@ -333,8 +358,8 @@ Reply with {{"status": "DONE"}} when you are done, JUST THE JSON, no additional 
         return {
             "active_node": node_name,
             "node_completed": node_completed,
-            "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
-            "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+            "input_tokens": state.get("input_tokens", 0) + input_tokens,
+            "output_tokens": state.get("output_tokens", 0) + output_tokens,
             "timeout": False,
             "model_error": False
         }
@@ -375,7 +400,7 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
     "reason": "explanation of failure, empty if passed"
 }}
 
-{memory.inject(node_name)}
+{memory.inject(node_name, current_task)}
 """
     print(f'EVALUATOR PROMPT: {prompt}')
     try:
@@ -383,7 +408,7 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
             invoke_model(evaluator_model, prompt),
             timeout=300
         )
-        usage = response.response_metadata.get("token_usage", {})
+        input_tokens, output_tokens = get_token_usage(response)
         cleaned_response = remove_think_from_message(response)
         memory.add_self_message(cleaned_response.model_copy(), node_name)
 
@@ -393,8 +418,8 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
         if status is PARSE_FAILED:
             return {
                 "active_node": node_name,
-                "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
-                "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+                "input_tokens": state.get("input_tokens", 0) + input_tokens,
+                "output_tokens": state.get("output_tokens", 0) + output_tokens,
                 "passed": False,
                 "node_completed": False,
                 "timeout": False,
@@ -410,13 +435,13 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
         if evaluation_ended:
             if not passed:
                 memory.send_message(cleaned_response.model_copy(), node_name, 'programmer')
-            memory.clear_l1(node_name)
+                memory.clear_l1(node_name)
 
         reflection_count = state.get("reflection_count", 0)
         return {
             "active_node": node_name,
-            "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
-            "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+            "input_tokens": state.get("input_tokens", 0) + input_tokens,
+            "output_tokens": state.get("output_tokens", 0) + output_tokens,
             "passed": passed,
             "node_completed": evaluation_ended,
             "reflection_count": reflection_count + 1 if evaluation_ended and not passed else reflection_count,
@@ -447,7 +472,7 @@ the current task:
 {current_task}
 
 the log:
-{memory.inject(node_name)}
+{memory.inject(node_name, current_task)}
 """
     print(f'COMPACTOR PROMPT: {prompt}')
     try:
@@ -455,14 +480,14 @@ the log:
             invoke_model(compactor_model, prompt),
             timeout=300
         )
-        usage = response.response_metadata.get("token_usage", {})
+        input_tokens, output_tokens = get_token_usage(response)
         cleaned_response = remove_think_from_message(response)
 
         memory.compact_l1(cleaned_response, node_name)
 
         return {
-            "input_tokens": state.get("input_tokens", 0) + usage.get("prompt_tokens", 0),
-            "output_tokens": state.get("output_tokens", 0) + usage.get("completion_tokens", 0),
+            "input_tokens": state.get("input_tokens", 0) + input_tokens,
+            "output_tokens": state.get("output_tokens", 0) + output_tokens,
             "timeout": False,
             "model_error": False,
         }
@@ -478,13 +503,180 @@ the log:
 
 async def memory_operator_node(state: AgentState):
     memory: MyMemory = state.get('memory')
+    current_task = state.get('current_task', {})
+    input_tokens_total = state.get("input_tokens", 0)
+    output_tokens_total = state.get("output_tokens", 0)
 
-    memory.clear_l1('programmer')
+    if memory.monolithic:
+        return {
+            "passed": False
+        }
+
+    relevant_files = memory.relevant_files_for_task(current_task)
+    for path in relevant_files:
+        content = tools.read_file.invoke({"path": path})
+        if not content or content.startswith("[Errno") or content.startswith("Error"):
+            continue
+
+        prompt = f"""
+You are the memory operator for an agentic code-generation harness.
+Summarize the current implementation of this file for future tasks.
+
+Focus on exposed interfaces, imports/dependencies, classes, functions, method signatures, exports, side effects, and factual constraints imposed by this file's current code or API.
+Describe only the file as it exists. Do not give advice, recommendations, implementation plans, or instructions to future agents.
+Do not include irrelevant prose. Keep it concise but complete.
+
+Expected response schema (raw JSON only. No markdown, no code fences, no explanation):
+{{
+    "summary": "Concise file summary for future tasks."
+}}
+
+Current task:
+{current_task}
+
+File path:
+{path}
+
+File content:
+{content}
+"""
+        try:
+            response = await asyncio.wait_for(
+                invoke_model(memory_operator_model, prompt),
+                timeout=300
+            )
+            input_tokens, output_tokens = get_token_usage(response)
+            input_tokens_total += input_tokens
+            output_tokens_total += output_tokens
+            cleaned_response = remove_think_from_message(response)
+            parsed = parse_json_response(cleaned_response.content)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
+                print(f"MEMORY OPERATOR L2 MALFORMED JSON for {path}")
+                continue
+            summary = parsed["summary"]
+            memory.update_l2(path, summary)
+        except asyncio.TimeoutError:
+            print(f"MEMORY OPERATOR L2 TIMEOUT for {path}")
+        except Exception as e:
+            print(f"MEMORY OPERATOR L2 ERROR for {path}: {e}")
+
+    l2_context = "\n\n".join(
+        f"{path}:\n{memory.l2[path]}"
+        for path in relevant_files
+        if path in memory.l2
+    )
+    task_log = "\n\n".join(
+        log
+        for log in (
+            memory.format_messages('programmer'),
+            memory.format_messages('evaluator'),
+        )
+        if log.strip()
+    )
+    insight_prompt = f"""
+You are the L3 memory operator for an agentic code-generation harness.
+
+Extract at most one durable project-level insight from the completed task.
+
+L3 memory is for cross-task knowledge only. Store an insight only if it is likely to help future tasks across multiple files or modules.
+
+Good L3 insights include:
+- Cross-module architecture or API conventions.
+- Non-obvious integration constraints between files.
+- Stable project-specific testing or validation lessons.
+- Repeated failure modes or gotchas observed during implementation/evaluation.
+- Decisions that future tasks must preserve for consistency.
+
+Do NOT store:
+- A summary of the completed task.
+- A summary of one file's functions/classes/imports.
+- Implementation details already suitable for L2 module memory.
+- General software advice.
+- Benchmark-specific strategy or knowledge about hidden evaluation.
+- Anything that is only useful for the exact task that just finished.
+
+If there is no cross-task insight, return an empty string.
+
+Expected response schema (raw JSON only. No markdown, no code fences, no explanation):
+{{
+    "insight": "One concise cross-task project insight, or empty string if none."
+}}
+
+Completed task:
+{current_task}
+
+Relevant module memory:
+{l2_context}
+
+Task transcript:
+{task_log}
+"""
+    try:
+        print(
+            "MEMORY OPERATOR L3 START "
+            f"(task_log_chars={len(task_log)}, l2_chars={len(l2_context)}, stored={len(memory.l3)})"
+        )
+        insight_response = await asyncio.wait_for(
+            invoke_model(memory_operator_model, insight_prompt),
+            timeout=300
+        )
+        input_tokens, output_tokens = get_token_usage(insight_response)
+        input_tokens_total += input_tokens
+        output_tokens_total += output_tokens
+        cleaned_insight = remove_think_from_message(insight_response)
+        parsed_insight = parse_json_response(cleaned_insight.content)
+        if not isinstance(parsed_insight, dict) or not isinstance(parsed_insight.get("insight"), str):
+            print("MEMORY OPERATOR L3 INSIGHT MALFORMED JSON")
+            parsed_insight = {"insight": ""}
+        insight = parsed_insight["insight"].strip()
+        if not insight:
+            print("MEMORY OPERATOR L3 NO CROSS-TASK INSIGHT")
+        else:
+            abstract_prompt = f"""
+Summarize this L3 project insight as one concise retrieval query sentence.
+
+Preserve only the concepts needed to retrieve the insight for future related tasks.
+Do not add new facts.
+
+Expected response schema (raw JSON only. No markdown, no code fences, no explanation):
+{{
+    "abstract": "Concise semantic retrieval sentence."
+}}
+
+Insight:
+{insight}
+"""
+            abstract_response = await asyncio.wait_for(
+                invoke_model(memory_operator_model, abstract_prompt),
+                timeout=300
+            )
+            input_tokens, output_tokens = get_token_usage(abstract_response)
+            input_tokens_total += input_tokens
+            output_tokens_total += output_tokens
+            cleaned_abstract = remove_think_from_message(abstract_response)
+            parsed_abstract = parse_json_response(cleaned_abstract.content)
+            if not isinstance(parsed_abstract, dict) or not isinstance(parsed_abstract.get("abstract"), str):
+                print("MEMORY OPERATOR L3 ABSTRACT MALFORMED JSON")
+                abstract = insight
+            else:
+                abstract = parsed_abstract["abstract"].strip() or insight
+            memory.insert_l3(abstract, insight)
+            print(f"MEMORY OPERATOR L3 STORED ({len(memory.l3)} total)")
+    except asyncio.TimeoutError:
+        print("MEMORY OPERATOR L3 TIMEOUT")
+    except OllamaEmbeddingError:
+        raise
+    except Exception as e:
+        print(f"MEMORY OPERATOR L3 ERROR: {e}")
+
+    memory.clear_all_l1()
 
     print('MEMORY OPERATOR entered, rerouting to planner')
 
     return {
-        "passed": False
+        "passed": False,
+        "input_tokens": input_tokens_total,
+        "output_tokens": output_tokens_total
     }
 
 
@@ -493,11 +685,15 @@ async def tool_node(state: AgentState):
     active = state["active_node"]
     last_message = memory.l1.get(active, [])[-1]
     results = []
+    workspace_changed = False
 
     for tool_call in last_message.tool_calls:
+        tool_name = tool_call["name"]
         try:
-            tool = tools_by_name[tool_call["name"]]
+            tool = tools_by_name[tool_name]
             observation = await tool.ainvoke(tool_call["args"])
+            if tool_name in {"write_file", "str_replace"} and not str(observation).startswith("Error:"):
+                workspace_changed = True
         except ValidationError as e:
             observation = (
                 f"INVALID TOOL CALL\n\n"
@@ -519,4 +715,6 @@ async def tool_node(state: AgentState):
     for result in results:
         memory.l1.setdefault(active, []).append(result)
 
+    if workspace_changed:
+        return {"last_workspace_change_time": time.monotonic(), "idle_timeout": False}
     return {}

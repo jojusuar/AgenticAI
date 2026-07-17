@@ -2,7 +2,7 @@ import asyncio
 from typing import Literal
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import RetryPolicy
-from langchain.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 import nodes
 import sys
 import json
@@ -15,6 +15,8 @@ MAX_PLANNER_RETRIES = 5
 MAX_CONTEXT_MESSAGES = 30
 MAX_INPUT_TOKENS = 8000000
 MAX_OUTPUT_TOKENS = 500000
+L3_INSIGHTS = 3
+WORKSPACE_IDLE_TIMEOUT_SECONDS = 40 * 60
 
 def budget_exceeded(state: nodes.AgentState) -> bool:
     return (
@@ -22,11 +24,22 @@ def budget_exceeded(state: nodes.AgentState) -> bool:
         or state.get("output_tokens", 0) >= MAX_OUTPUT_TOKENS
     )
 
-def route_tool_response(state: nodes.AgentState) -> Literal["planner", "programmer", "evaluator", "compactor"]:
+def workspace_idle_timeout_exceeded(state: nodes.AgentState) -> bool:
+    last_change = state.get("last_workspace_change_time")
+    if last_change is None:
+        return False
+    return time.monotonic() - last_change >= WORKSPACE_IDLE_TIMEOUT_SECONDS
+
+def should_end(state: nodes.AgentState) -> bool:
+    return budget_exceeded(state) or workspace_idle_timeout_exceeded(state)
+
+def route_tool_response(state: nodes.AgentState) -> Literal["planner", "programmer", "evaluator", "compactor", END]:
+    if should_end(state):
+        return END
     return state.get('active_node')
 
 def route_planner(state: nodes.AgentState) -> Literal["tool_node", "programmer", "planner", "compactor", END]:
-    if budget_exceeded(state) or state.get("planner_retries", 0) >= MAX_PLANNER_RETRIES:
+    if should_end(state) or state.get("planner_retries", 0) >= MAX_PLANNER_RETRIES:
         return END
     memory = state.get('memory')
     log = memory.l1.get("planner", [])
@@ -42,7 +55,7 @@ def route_planner(state: nodes.AgentState) -> Literal["tool_node", "programmer",
     return "planner"
 
 def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", END]:
-    if budget_exceeded(state):
+    if should_end(state):
         return END
     memory = state.get('memory')
     log = memory.l1.get("programmer", [])
@@ -56,7 +69,7 @@ def route_programmer(state: nodes.AgentState) -> Literal["tool_node", "programme
     return "programmer"
 
 def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer", "evaluator", "compactor", "memory_operator", "planner", END]:
-    if budget_exceeded(state):
+    if should_end(state):
         return END
     memory = state.get('memory')
     if state.get("reflection_count") >= MAX_FEEDBACK_LOOPS_PER_TASK:
@@ -77,13 +90,13 @@ def route_evaluator(state: nodes.AgentState) -> Literal["tool_node", "programmer
         return "memory_operator"
     return "programmer"
 
-def route_compactor(state: nodes.AgentState) -> Literal["programmer", "evaluator", "compactor", END]:
-    if budget_exceeded(state):
+def route_compactor(state: nodes.AgentState) -> Literal["planner", "programmer", "evaluator", "compactor", END]:
+    if should_end(state):
         return END
     return state.get('active_node')
 
 def route_memory_operator(state: nodes.AgentState) -> Literal["planner", END]:
-    if state.get('finished'):
+    if should_end(state) or state.get('finished'):
         return END
     return "planner"
 
@@ -101,8 +114,8 @@ graph.add_edge(START, "planner")
 graph.add_conditional_edges("planner", route_planner, ["tool_node", "programmer", "planner", "compactor", END])
 graph.add_conditional_edges("programmer", route_programmer, ["tool_node", "programmer", "evaluator", "compactor", END])
 graph.add_conditional_edges("evaluator", route_evaluator, ["tool_node", "programmer", "evaluator", "compactor", "memory_operator", "planner", END])
-graph.add_conditional_edges("tool_node", route_tool_response, ["planner", "programmer", "evaluator", "compactor"])
-graph.add_conditional_edges("compactor", route_compactor, ["programmer", "evaluator", "compactor", END])
+graph.add_conditional_edges("tool_node", route_tool_response, ["planner", "programmer", "evaluator", "compactor", END])
+graph.add_conditional_edges("compactor", route_compactor, ["planner", "programmer", "evaluator", "compactor", END])
 graph.add_conditional_edges("memory_operator", route_memory_operator, ["planner", END])
 
 agent = graph.compile()
@@ -111,14 +124,30 @@ def parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-async def runloop(prompt: str, memory: bool = True):
+def parse_int(value: str, minimum: int = 0) -> int:
+    parsed = int(value.strip())
+    if parsed < minimum:
+        raise ValueError(f"Expected integer >= {minimum}, got {parsed}")
+    return parsed
+
+
+async def runloop(prompt: str, memory: bool = True, l3_insights: int = L3_INSIGHTS):
+    graph_memory = MyMemory(memory=memory, l3_insights=l3_insights)
+    start_time = time.monotonic()
+    if memory:
+        embedding = graph_memory.embed_text("AUTOSOURCE memory embedding preflight")
+        print(f"OLLAMA EMBEDDING PREFLIGHT OK ({len(embedding)} dimensions)")
+
     result = await agent.ainvoke({
-        "memory": MyMemory(memory=memory),
+        "memory": graph_memory,
         "reflection_count": 0,
         "finished": False,
         "node_completed": False,
         "current_task": {},
-        "planner_retries": 0
+        "planner_retries": 0,
+        "start_time": start_time,
+        "last_workspace_change_time": start_time,
+        "idle_timeout": False
     })
     return result
 
@@ -135,16 +164,21 @@ if __name__ == "__main__":
 
         prompt_file = sys.argv[1]
         memory = True
+        l3_insights = L3_INSIGHTS
         for arg in sys.argv[2:]:
             if arg.startswith("memory="):
                 memory = parse_bool(arg.split("=", 1)[1])
             elif arg.startswith("--memory="):
                 memory = parse_bool(arg.split("=", 1)[1])
+            elif arg.startswith("l3_insights="):
+                l3_insights = parse_int(arg.split("=", 1)[1])
+            elif arg.startswith("--l3-insights="):
+                l3_insights = parse_int(arg.split("=", 1)[1])
 
         with open(prompt_file) as f:
             prompt = f.read()
 
-        result = asyncio.run(runloop(prompt, memory=memory))
+        result = asyncio.run(runloop(prompt, memory=memory, l3_insights=l3_insights))
 
         with open("/app/workspace/usage.json", "w") as f:
             json.dump({
