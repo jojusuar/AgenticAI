@@ -173,14 +173,9 @@ def normalize_planner_response(cleaned):
     if not isinstance(current_task, dict):
         current_task = {}
 
-    for key in ("test_instructions", "target_module", "relevant_files", "target_file_structure"):
+    for key in ("test_instructions", "target_files", "relevant_files", "target_file_structure"):
         if key not in current_task and key in cleaned:
             current_task[key] = cleaned[key]
-
-    if not current_task.get("target_module"):
-        relevant_files = current_task.get("relevant_files") or []
-        if relevant_files:
-            current_task["target_module"] = relevant_files[0]
 
     return current_task, project_info, finished
 
@@ -217,7 +212,10 @@ You DON'T implement code.
 
 Plan only the immediate next implementation task needed to satisfy the specification at start.md.
 Do not create a task list. Do not plan future tasks beyond the next one.
-Each task must be small and must require implementing or modifying only one module.
+Each task must represent one coherent, independently evaluable change.
+Prefer a single target file, but allow up to five target files when all of them are necessary for the same feature, integration boundary, or scaffolding operation.
+Scaffolding tasks may group closely related package metadata, directory initializers, entry points, and minimal test structure.
+Do not group unrelated functionality into one task. Every target file must be justified by the task description.
 The task must be self-contained and finishable from the repository state that exists now.
 Do not assign a task that depends on code, modules, package metadata, tests, or generated artifacts that have not been created yet.
 If needed, choose an earlier enabling task instead.
@@ -230,8 +228,8 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
     "task": {{
         "task": "Short task description, class definitions or function signatures if applicable, and any relevant details for implementation.",
         "test_instructions": "Instructions for the evaluator to test this single task, like running tests, verifying imports, or empirical evaluation, but NO WRITING CODE.",
-        "target_module": "The single module/file the programmer should implement or modify for this task.",
-        "relevant_files": ["names", "of", "files", "relevant", "to", "this", "task"],
+        "target_files": ["One to five files the programmer must create or modify for this task."],
+        "relevant_files": ["Existing files useful for context but not intended to be modified by this task."],
         "target_file_structure": {{
                                     "folder1": {{
                                         "subfolder1": ["file1.py", "file2.py"],
@@ -271,7 +269,20 @@ Expected response schema (raw JSON only. No markdown, no code fences, no explana
         valid_task = (
             isinstance(current_task, dict)
             and current_task.get('task')
-            and current_task.get('target_module')
+            and isinstance(current_task.get('target_files'), list)
+            and 1 <= len(current_task.get('target_files')) <= 5
+            and all(
+                isinstance(path, str) and bool(path.strip())
+                for path in current_task.get('target_files')
+            )
+            and len(set(current_task.get('target_files'))) == len(current_task.get('target_files'))
+            and isinstance(current_task.get('relevant_files'), list)
+            and all(
+                isinstance(path, str) and bool(path.strip())
+                for path in current_task.get('relevant_files')
+            )
+            and len(set(current_task.get('relevant_files'))) == len(current_task.get('relevant_files'))
+            and not set(current_task.get('target_files')).intersection(current_task.get('relevant_files'))
         )
         if (finished or valid_task) and project_info:
             node_completed = True
@@ -308,11 +319,6 @@ async def programmer_node(state: AgentState):
     node_name = 'programmer'
     info = state.get('project_info', '')
     current_task = state.get('current_task', {})
-    # instructions = current_task.get('task', 'No task available.')
-    # evaluator_instructions = current_task.get('test', 'No task available.')
-    # relevant_files = current_task.get('relevant_files', [])
-    # target_file_structure = current_task.get('target_file_structure', '')
-
     prompt = f"""
 You are an expert software programmer.
 
@@ -378,10 +384,6 @@ async def evaluator_node(state: AgentState):
     node_name = 'evaluator'
     info = state.get('project_info', '')
     current_task = state.get('current_task', {})
-    # instructions = current_task.get('test_instructions', 'No task available.')
-    # relevant_files = current_task.get('relevant_files', [])
-    # target_file_structure = current_task.get('target_file_structure', '')
-
     prompt = f"""
 You are an expert QA evaluator.
 

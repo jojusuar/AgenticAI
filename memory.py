@@ -150,7 +150,7 @@ class MyMemory:
 
     def relevant_files_for_task(self, task: dict[str, Any]) -> list[str]:
         files = []
-        for key in ("target_module", "relevant_files"):
+        for key in ("target_files", "relevant_files"):
             value = task.get(key)
             if isinstance(value, str):
                 files.append(value)
@@ -283,7 +283,7 @@ class MyMemory:
             return "Known project memory insights from completed tasks:\n" + "\n".join(lines)
         query = "\n".join(
             str(task.get(key, ""))
-            for key in ("task", "test_instructions", "target_module")
+            for key in ("task", "test_instructions", "target_files")
         )
         insights = self.retrieve_l3(query, k=k)
         if not insights:
