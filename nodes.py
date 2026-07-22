@@ -59,7 +59,7 @@ all_tools = [tools.read_file, tools.bash, tools.write_file, tools.str_replace]
 tools_by_name = {tool.name: tool for tool in all_tools}
 
 worker_tools = [tools.read_file, tools.write_file, tools.str_replace, tools.bash]
-evaluator_tools = [tools.read_file, tools.bash, *cg_tools]
+evaluator_tools = [tools.read_file, tools.bash]
 planner_tools = [tools.read_file, tools.bash]
 
 programmer_model = programmer_model.bind_tools(worker_tools)
