@@ -89,6 +89,11 @@ class MyMemory:
         self.l1.setdefault(node, []).append(message)
 
     def send_message(self, message: AnyMessage, source_node: str, target_node: str):
+        # In monolithic mode every node already reads the same shared log, and
+        # callers record their response with add_self_message before sending it.
+        # Appending again would duplicate the message in the shared transcript.
+        if self.monolithic:
+            return
         content = get_content(message)
         content = f'{source_node.upper()}: {content}'
         message.content = content
