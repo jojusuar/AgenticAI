@@ -1,6 +1,4 @@
-codegraph-mcp-server==0.8.0
 langchain-core==1.4.0
-langchain-mcp-adapters==0.2.2
 langchain-openai==1.2.2
 langgraph==1.2.4
 ollama==0.6.2

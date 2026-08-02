@@ -1,8 +1,11 @@
+import hashlib
 import math
 import os
 import re
 from pathlib import PurePosixPath
 from typing import Any
+
+import tools
 
 try:
     import ollama
@@ -21,6 +24,23 @@ class OllamaEmbeddingError(RuntimeError):
     pass
 
 
+def normalize_workspace_path(path: str) -> str | None:
+    """Normalize a model/tool path to a safe workspace-relative POSIX key."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    replaced = path.strip().replace("\\", "/")
+    normalized = PurePosixPath(replaced)
+    if (
+        "\x00" in replaced
+        or normalized.is_absolute()
+        or re.match(r"^[A-Za-z]:", replaced)
+        or ".." in normalized.parts
+        or str(normalized) in {"", "."}
+    ):
+        return None
+    return str(normalized)
+
+
 def get_content(message) -> str:
     if isinstance(message.content, str):
         return message.content
@@ -31,17 +51,6 @@ def get_content(message) -> str:
             if isinstance(block, dict)
         )
     return ""
-
-
-def remove_think_from_content(text: str) -> str:
-    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-
-
-def remove_think_from_message(message: AIMessage) -> AIMessage:
-    cleaned_content = remove_think_from_content(get_content(message))
-    msg = message.model_copy()
-    msg.content = cleaned_content
-    return msg
 
 
 class MonolithicLog(dict):
@@ -71,15 +80,33 @@ class MyMemory:
     l2: dict
     l3: dict
 
-    def __init__(self, memory: bool = True, l3_insights: int = 5):
-        self.memory = memory
-        self.monolithic = not memory
-        self.l3_insights = l3_insights
+    def __init__(
+        self,
+        memory: bool | None = None,
+        l1_enabled: bool = True,
+        l2_enabled: bool = True,
+        l3_enabled: bool = True,
+        l3_similarity_threshold: float = 0.60,
+    ):
+        if memory is not None:
+            l1_enabled = memory
+            l2_enabled = memory
+            l3_enabled = memory
+        self.l1_enabled = l1_enabled
+        self.l2_enabled = l2_enabled
+        self.l3_enabled = l3_enabled
+        self.memory = l1_enabled or l2_enabled or l3_enabled
+        self.monolithic = not l1_enabled
+        if not 0.0 <= l3_similarity_threshold <= 1.0:
+            raise ValueError("l3_similarity_threshold must be between 0.0 and 1.0")
+        self.l3_similarity_threshold = l3_similarity_threshold
         self.l1 = MonolithicLog("all") if self.monolithic else {}
         self.l2 = {}
         self.l2_hashes = {}
         self.programmer_touched_files = set()
         self.l3 = []
+        self.l3_next_id = 1
+        self.l1_task_checkpoint = 0
 
     def add_self_message(self, message: AIMessage, node: str):
         content = get_content(message)
@@ -103,8 +130,9 @@ class MyMemory:
     def compact_l1(self, compacted: AIMessage, node: str):
         self.l1[node] = [compacted]
 
-    def format_messages(self, node: str) -> str:
+    def format_messages(self, node: str, start_index: int = 0) -> str:
         messages = self.l1.get(node, [])
+        messages = messages[max(start_index, 0):]
         if not messages:
             return ""
         lines = []
@@ -124,17 +152,24 @@ class MyMemory:
                 lines.append(f"{prefix}:\n{content}")
         return "\n\n".join(lines)
 
+    def advance_l1_task_checkpoint(self):
+        """Mark the end of the current task in the shared monolithic transcript."""
+        if self.monolithic:
+            self.l1_task_checkpoint = len(self.l1.get("all", []))
+
     def inject(self, node: str, task: dict[str, Any] | None = None) -> str:
         label = "Shared log" if self.monolithic else "Your log"
         l1 = f'''{label} (last is most recent):\n{self.format_messages(node)}'''
-        if self.monolithic or task is None:
+        if task is None:
             return l1
 
         return "\n\n".join(
             section
             for section in (
-                self.inject_l2(task, node),
-                self.inject_l3(task, node),
+                self.inject_l2(task, node) if self.l2_enabled else "",
+                self.inject_l3(task, node)
+                if self.l3_enabled and node != "planner"
+                else "",
                 l1,
             )
             if section.strip()
@@ -161,54 +196,105 @@ class MyMemory:
                 files.append(value)
             elif isinstance(value, list):
                 files.extend(item for item in value if isinstance(item, str))
-        return list(dict.fromkeys(files))
+        normalized = (
+            normalize_workspace_path(path)
+            for path in files
+        )
+        return list(dict.fromkeys(path for path in normalized if path is not None))
 
     def update_l2(self, path: str, summary: str):
-        if summary.strip():
-            self.l2[path] = summary.strip()
+        normalized = normalize_workspace_path(path)
+        if normalized is not None and summary.strip():
+            self.l2[normalized] = summary.strip()
 
-    def track_programmer_file(self, path: str):
+    def track_programmer_file(self, path: str) -> bool:
         """Record a successfully mutated workspace-relative file for the next L2 pass."""
-        normalized = PurePosixPath(path.replace("\\", "/"))
-        if normalized.is_absolute() or ".." in normalized.parts:
+        normalized = normalize_workspace_path(path)
+        if normalized is None:
+            return False
+        self.programmer_touched_files.add(normalized)
+        return True
+
+    def remove_l2(self, path: str):
+        """Remove memory for a file that no longer exists."""
+        normalized = normalize_workspace_path(path)
+        if normalized is None:
             return
-        self.programmer_touched_files.add(str(normalized))
+        self.l2.pop(normalized, None)
+        self.l2_hashes.pop(normalized, None)
+        self.programmer_touched_files.discard(normalized)
 
     def complete_l2_update(self, path: str, content_hash: str, summary: str):
         """Commit summary and hash atomically after a successful L2 model response."""
+        normalized = normalize_workspace_path(path)
         summary = summary.strip()
-        if not summary:
+        if normalized is None or not summary:
             return
-        self.l2[path] = summary
-        self.l2_hashes[path] = content_hash
-        self.programmer_touched_files.discard(path)
+        self.l2[normalized] = summary
+        self.l2_hashes[normalized] = content_hash
+        self.programmer_touched_files.discard(normalized)
 
     def mark_l2_unchanged(self, path: str):
-        self.programmer_touched_files.discard(path)
+        normalized = normalize_workspace_path(path)
+        if normalized is not None:
+            self.programmer_touched_files.discard(normalized)
+
+    def valid_l2_summaries(self, paths: list[str]) -> list[tuple[str, str]]:
+        """Return only summaries whose stored hash matches the current workspace file."""
+        valid = []
+        for candidate in paths:
+            path = normalize_workspace_path(candidate)
+            if path is None:
+                continue
+            summary = self.l2.get(path)
+            if summary is None:
+                continue
+
+            try:
+                content_hash = hashlib.sha256(tools.safe_path(path).read_bytes()).hexdigest()
+            except (AssertionError, OSError):
+                self.l2.pop(path, None)
+                self.l2_hashes.pop(path, None)
+                self.programmer_touched_files.discard(path)
+                print(f"MEMORY INJECT L2 REMOVED UNREADABLE {path}")
+                continue
+
+            if self.l2_hashes.get(path) != content_hash:
+                # Suppress stale (and legacy unhashed) entries immediately and
+                # queue the file for the next L2 maintenance pass.
+                self.programmer_touched_files.add(path)
+                print(f"MEMORY INJECT L2 SUPPRESSED STALE {path}")
+                continue
+
+            valid.append((path, summary))
+        return valid
 
     def inject_l2(self, task: dict[str, Any], node: str) -> str:
+        if not self.l2_enabled:
+            return ""
         if node == "planner":
-            if not self.l2:
-                return ""
             summaries = [
                 f"{path}:\n{summary}"
-                for path, summary in self.l2.items()
+                for path, summary in self.valid_l2_summaries(list(self.l2))
             ]
+            if not summaries:
+                return ""
             return (
-                "Known module memory from completed tasks. Prefer these summaries over reading full files unless exact code is necessary:\n"
+                "Current workspace snapshot summaries. These briefly describe the relevant files' current state, "
+                "but are not a declaration of implementation correctness:\n"
                 + "\n\n".join(summaries)
             )
 
         files = self.relevant_files_for_task(task)
         summaries = [
-            f"{path}:\n{self.l2[path]}"
-            for path in files
-            if path in self.l2
+            f"{path}:\n{summary}"
+            for path, summary in self.valid_l2_summaries(files)
         ]
         if not summaries:
             return ""
         return (
-            "Module memory for files relevant to the current task. Prefer these summaries over reading full files unless exact code is necessary:\n"
+            "Current workspace snapshot summaries. These briefly describe the relevant files' current state, "
+            "but are not a declaration of implementation correctness:\n"
             + "\n\n".join(summaries)
         )
 
@@ -236,19 +322,55 @@ class MyMemory:
         except (TypeError, ValueError) as e:
             raise OllamaEmbeddingError(f"Ollama embedding contains non-numeric values: {embedding!r}") from e
 
-    def insert_l3(self, abstract: str, insight: str):
+    def has_exact_l3_insight(self, insight: str) -> bool:
+        normalized = " ".join(insight.lower().split())
+        return any(
+            " ".join(str(item.get("insight", "")).lower().split()) == normalized
+            for item in self.l3
+        )
+
+    def insert_l3(
+        self,
+        abstract: str,
+        insight: str,
+        replace_ids: list[str] | None = None,
+    ) -> bool:
         abstract = abstract.strip()
         insight = insight.strip()
         if not abstract or not insight:
-            return
+            return False
+        if self.has_exact_l3_insight(insight):
+            return False
         embedding = self.embed_text(abstract)
         if not embedding:
-            return
+            return False
+        if replace_ids:
+            replace_id_set = set(replace_ids)
+            self.l3 = [
+                item
+                for item in self.l3
+                if item.get("id") not in replace_id_set
+            ]
+        insight_id = f"l3-{self.l3_next_id}"
+        self.l3_next_id += 1
         self.l3.append({
+            "id": insight_id,
             "abstract": abstract,
             "insight": insight,
             "embedding": embedding,
         })
+        return True
+
+    def l3_reconciliation_view(self) -> list[dict[str, str]]:
+        """Return the complete L3 list without embeddings for model reconciliation."""
+        return [
+            {
+                "id": str(item.get("id", f"legacy-{index}")),
+                "abstract": str(item.get("abstract", "")),
+                "insight": str(item.get("insight", "")),
+            }
+            for index, item in enumerate(self.l3, start=1)
+        ]
 
     def cosine_similarity(self, left: list[float], right: list[float]) -> float:
         if not left or not right or len(left) != len(right):
@@ -260,37 +382,53 @@ class MyMemory:
             return 0.0
         return dot / (left_norm * right_norm)
 
-    def retrieve_l3(self, query: str, k: int = 5) -> list[dict[str, Any]]:
+    def retrieve_l3(self, query: str) -> list[dict[str, Any]]:
         if not query.strip() or not self.l3:
             return []
         query_embedding = self.embed_text(query)
         if not query_embedding:
             return []
-        ranked = sorted(
-            self.l3,
-            key=lambda item: self.cosine_similarity(query_embedding, item["embedding"]),
+        scored = sorted(
+            (
+                (
+                    self.cosine_similarity(query_embedding, item["embedding"]),
+                    item,
+                )
+                for item in self.l3
+            ),
+            key=lambda pair: pair[0],
             reverse=True,
         )
-        return ranked[:k]
+        score_log = ", ".join(
+            f"{item.get('id', 'legacy')}={score:.4f}"
+            for score, item in scored
+        )
+        print(
+            "MEMORY INJECT L3 SCORES "
+            f"(threshold={self.l3_similarity_threshold:.4f}): {score_log}"
+        )
+        return [
+            item
+            for score, item in scored
+            if score >= self.l3_similarity_threshold
+        ]
 
-    def inject_l3(self, task: dict[str, Any], node: str, k: int | None = None) -> str:
-        if k is None:
-            k = self.l3_insights
+    def inject_l3(self, task: dict[str, Any], node: str) -> str:
+        if not self.l3_enabled or node == "planner":
+            return ""
         if not self.l3:
             print("MEMORY INJECT L3 SKIPPED (stored=0)")
             return ""
-        if node == "planner":
-            print(f"MEMORY INJECT L3 ALL {len(self.l3)} for planner")
-            lines = [
-                f"- {item['insight']}"
-                for item in self.l3
-            ]
-            return "Known project memory insights from completed tasks:\n" + "\n".join(lines)
         query = "\n".join(
             str(task.get(key, ""))
-            for key in ("task", "test_instructions", "target_files")
+            for key in (
+                "task",
+                "test_instructions",
+                "target_files",
+                "relevant_files",
+            )
         )
-        insights = self.retrieve_l3(query, k=k)
+        insights = self.retrieve_l3(query)
         if not insights:
             print(f"MEMORY INJECT L3 SKIPPED (stored={len(self.l3)}, retrieved=0)")
             return ""
@@ -299,4 +437,8 @@ class MyMemory:
             f"- {item['insight']}"
             for item in insights
         ]
-        return "Project memory insights relevant to the current task:\n" + "\n".join(lines)
+        return (
+            "Historical project insights relevant to the current task. Use them as guidance, "
+            "and verify them against current files when present behavior matters:\n"
+            + "\n".join(lines)
+        )
